@@ -1,0 +1,58 @@
+name: stova
+services:
+  db:
+    image: postgres:17-alpine
+    pull_policy: never
+    environment:
+      POSTGRES_USER: stova
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Runtime password required}
+      POSTGRES_DB: stova
+    command: [postgres, -c, shared_buffers=32MB, -c, max_connections=40, -c, work_mem=1MB]
+    volumes:
+      - stova-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U stova -d stova]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 192m
+    restart: unless-stopped
+    logging:
+      driver: local
+      options: {max-size: 5m, max-file: '2'}
+  api:
+    image: stova-api:release
+    pull_policy: never
+    environment:
+      DATABASE_URL: postgresql+asyncpg://stova:${POSTGRES_PASSWORD}@db:5432/stova
+      JWT_SECRET: ${JWT_SECRET:?Runtime signing secret required}
+      COOKIE_SECURE: 'true'
+      ENVIRONMENT: production
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?CloudFront origin required}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_AI_FREE_TIER_CONFIRMED: ${CLOUDFLARE_AI_FREE_TIER_CONFIRMED:-false}
+    depends_on:
+      db: {condition: service_healthy}
+    mem_limit: 384m
+    restart: unless-stopped
+    logging:
+      driver: local
+      options: {max-size: 5m, max-file: '2'}
+  web:
+    image: stova-web:release
+    pull_policy: never
+    ports: ['8080:8080']
+    environment:
+      BACKEND_URL: http://api:8000
+      PUBLIC_HTTPS: 'true'
+      ORIGIN_VERIFY_SECRET: ${ORIGIN_VERIFY_SECRET:?Origin verification required}
+    depends_on:
+      api: {condition: service_healthy}
+    mem_limit: 128m
+    restart: unless-stopped
+    logging:
+      driver: local
+      options: {max-size: 5m, max-file: '2'}
+volumes:
+  stova-postgres:

@@ -1,0 +1,59 @@
+name: Deploy to AWS Free plan
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aws-production
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main' && vars.AWS_ROLE_ARN != '' && vars.AWS_STACK_NAME != '' && vars.AWS_REGION != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_STACK_NAME: ${{ vars.AWS_STACK_NAME }}
+      AWS_EC2_METADATA_DISABLED: 'true'
+      TEST_DATABASE_URL: postgresql+asyncpg://stova:stova_ci_only@127.0.0.1:5432/stova_test
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: stova
+          POSTGRES_PASSWORD: stova_ci_only
+          POSTGRES_DB: stova_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U stova -d stova_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: pip install -e './backend[test]' -r gateway/requirements.txt boto3
+      - run: python -m pytest -c backend/pyproject.toml backend/tests tests -q --import-mode=importlib
+      - run: python -m unittest discover -s infra/aws/tests -v
+      - name: Check frontend before deployment
+        working-directory: frontend
+        run: npm ci && npm test && npm run build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Refuse paid or unknown AWS plans
+        run: python scripts/aws_deploy.py plan --region "$AWS_REGION"
+      - name: Build deployment images
+        run: |
+          docker build -f backend/Dockerfile -t stova-api:release .
+          docker build -f Dockerfile -t stova-web:release .
+          docker pull postgres:17-alpine
+          docker save stova-api:release stova-web:release postgres:17-alpine | gzip > images.tar.gz
+      - name: Deploy the immutable release
+        run: python scripts/aws_deploy.py release --region "$AWS_REGION" --stack "$AWS_STACK_NAME" --archive images.tar.gz --release-id "$GITHUB_SHA"

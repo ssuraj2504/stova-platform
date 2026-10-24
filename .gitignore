@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.env
+.env.*
+!.env.example
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+outputs/
+.aws-state/
+*.pem
+*.key
+.DS_Store

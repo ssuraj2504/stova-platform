@@ -1,0 +1,73 @@
+name: Verify Stova
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: stova
+          POSTGRES_PASSWORD: stova_ci_only
+          POSTGRES_DB: stova_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U stova -d stova_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://stova:stova_ci_only@127.0.0.1:5432/stova_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            backend/pyproject.toml
+            gateway/requirements.txt
+      - run: pip install -e './backend[test]' -r gateway/requirements.txt boto3 cfn-lint
+      - run: python -m pytest -c backend/pyproject.toml backend/tests tests -q --import-mode=importlib
+      - run: python -m unittest discover -s infra/aws/tests -v
+      - run: cfn-lint infra/aws/template.json
+      - run: python -m compileall -q backend/app gateway scripts
+  containers:
+    needs: [frontend, backend]
+    runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: stova_ci_only
+      JWT_SECRET: stova_ci_signing_key_only_at_least_32_characters
+      COOKIE_SECURE: 'false'
+      ENVIRONMENT: test
+      ALLOWED_ORIGINS: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: docker compose up -d --build --wait --wait-timeout 240
+      - run: python scripts/smoke.py
+      - if: failure()
+        run: docker compose logs --no-color --tail 80
+      - if: always()
+        run: docker compose down -v
