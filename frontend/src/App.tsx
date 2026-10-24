@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Check, ChevronDown, Download, ExternalLink, FileText, FolderOpen, Globe, Loader2, MoreHorizontal, Pause, Plus, RefreshCw, Save, Search, Settings2, Trash2, Upload, X } from "lucide-react";
-import type { Article, Project, User } from "@/types";
+import type { Article, Project, ProjectSummary, User } from "@/types";
 import TopicComposer, { type TopicInput } from "@/components/TopicComposer";
 import ArticleStudio from "@/components/ArticleStudio";
 import AuthPortal from "@/components/AuthPortal";
 import PublicReader from "@/components/PublicReader";
+import { canLeavePublication, publicationHasChanges, runExclusiveAction, warnBeforeUnload } from "@/lib/publication-work";
 
 type View = "articles" | "publications" | "topics" | "settings";
 type Brand = Pick<Project, "name" | "logo" | "color" | "audience" | "tone">;
@@ -35,7 +36,7 @@ function sharedPaused(status: WritingStatus | null) { return status?.status === 
 
 function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout: () => Promise<void>; onSessionExpired: () => void }) {
   const [view, setView] = useState<View>("articles");
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [brand, setBrand] = useState<Brand>(initialBrand);
   const [topics, setTopics] = useState<TopicInput[]>(initialTopics);
@@ -54,7 +55,7 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
   const [editing, setEditing] = useState<Article | null>(null);
-  const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ProjectSummary | null>(null);
   const [connectionModal, setConnectionModal] = useState(false);
   const [returnView, setReturnView] = useState<View | null>(null);
   const [generating, setGenerating] = useState<string | null>(null);
@@ -67,6 +68,7 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
   const keyRef = useRef("");
   const configuredRef = useRef(false);
   const healthRunning = useRef(false);
+  const draftOperation = useRef(false);
   const serverConfigured = !writingStatusError && sharedAvailable(writingStatus);
   const managedPaused = sharedPaused(writingStatus);
   const managedReset = utcReset(writingStatus?.cloudflare.usage?.resetsAt);
@@ -77,7 +79,7 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
   const ready = project?.articles.filter(a => a.status === "ready" || a.status === "published").length || 0;
   const published = project?.articles.filter(a => a.status === "published").length || 0;
   const cleanTopics = topics.filter(topic => topic.title.trim());
-  const dirty = project ? ["name", "color", "logo", "audience", "tone"].some(key => brand[key as keyof Brand] !== project[key as keyof Brand]) || topics.some((topic, index) => { const article = project.articles[index]; return !article || article.id !== topic.id || article.title !== topic.title || (article.tag || "") !== topic.tag || (article.constraints || "") !== topic.constraints; }) : !!brand.name || topics.some(t => !!t.title);
+  const dirty = publicationHasChanges(brand, topics, project, initialBrand);
 
   function failure(err: unknown) {
     const message = err instanceof Error ? err.message : "Something went wrong. Please try again.";
@@ -125,12 +127,17 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
   }, [refreshWritingStatus]);
 
   useEffect(() => {
-    request<{ projects: Project[] }>("/api/projects").then(result => { setProjects(result.projects); }).catch(failure).finally(() => setLoading(false));
+    request<{ projects: ProjectSummary[] }>("/api/projects").then(result => { setProjects(result.projects); }).catch(failure).finally(() => setLoading(false));
     checkHealth();
     const timer = setInterval(() => { if (document.visibilityState === "visible") checkHealth(!!keyRef.current || configuredRef.current); }, 60000);
     return () => clearInterval(timer);
   }, [checkHealth]);
   useEffect(() => { if (toast) { const timer = setTimeout(() => setToast(""), 4500); return () => clearTimeout(timer); } }, [toast]);
+  useEffect(() => {
+    const warn = (event: BeforeUnloadEvent) => warnBeforeUnload(dirty, event);
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
   useEffect(() => {
     if (!deleteTarget && !connectionModal) return;
     const previous = document.body.style.overflow;
@@ -141,19 +148,31 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
   }, [deleteTarget, connectionModal, busy]);
 
   function navigate(next: View) {
-    if (working) return;
+    if (working || draftOperation.current) return;
     if (editing) { if (next === "settings") setConnectionModal(true); return; }
     setView(next); setError("");
   }
+  function confirmPublicationChange() {
+    return canLeavePublication(dirty, () => window.confirm("You have unsaved brand or topic changes. Discard them and leave this publication?"));
+  }
   function newPublication() {
-    if (working || editing) return;
+    if (working || editing || draftOperation.current || !confirmPublicationChange()) return;
     setProject(null); setBrand(initialBrand); setTopics(initialTopics()); setError(""); setView("articles");
   }
   async function selectPublication(id: string) {
     if (id === "new") { newPublication(); return; }
-    if (working || editing) return;
+    if (working || editing || draftOperation.current) return;
+    if (id === project?.id) { setView("articles"); return; }
+    if (!confirmPublicationChange()) return;
     setBusy(true); setError("");
     try { const result = await request<{ project: Project }>(`/api/projects/${id}`); hydrate(result.project); setView("articles"); }
+    catch (err) { failure(err); }
+    finally { setBusy(false); }
+  }
+  async function signOut() {
+    if (working || editing || draftOperation.current || !confirmPublicationChange()) return;
+    setBusy(true);
+    try { await onLogout(); }
     catch (err) { failure(err); }
     finally { setBusy(false); }
   }
@@ -186,10 +205,9 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
     if (project && cleanTopics.length !== topics.length) throw new Error("Each saved topic needs a title.");
     if (new Set(cleanTopics.map(t => t.title.trim().toLowerCase())).size !== cleanTopics.length) throw new Error("Use a different title for each topic.");
   }
-  async function saveDraft(): Promise<Project | null> {
+  async function persistDraft(): Promise<Project | null> {
     setError("");
     try { validateDraft(); } catch (err) { failure(err); return null; }
-    setBusy(true);
     try {
       let next: Project;
       if (!project) {
@@ -202,7 +220,16 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
       }
       hydrate(next); setToast("Publication draft saved."); return next;
     } catch (err) { failure(err); return null; }
-    finally { setBusy(false); }
+  }
+  async function runDraftOperation<T>(action: () => Promise<T>): Promise<T | undefined> {
+    return runExclusiveAction(draftOperation, async () => {
+      setBusy(true);
+      try { return await action(); }
+      finally { setBusy(false); setGenerating(null); setStreamText(""); }
+    });
+  }
+  async function saveDraft(): Promise<Project | null> {
+    return (await runDraftOperation(persistDraft)) ?? null;
   }
   async function streamArticle(current: Project, article: Article): Promise<Article> {
     const response = await fetch(`/api/projects/${current.id}/articles/${article.id}/stream`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: keyRef.current }) });
@@ -234,40 +261,43 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
     return completed;
   }
   async function generateDrafts(onlyId?: string) {
-    if (!apiKey.trim()) {
-      const latest = await refreshWritingStatus();
-      if (!sharedAvailable(latest)) {
-        setReturnView(view); setView("settings");
-        setError(sharedPaused(latest) ? `Shared writing is paused until ${utcReset(latest?.cloudflare.usage?.resetsAt)}. Your drafts are safe.` : "Shared free writing is not ready yet. The site owner can finish setup; visitors do not need a key.");
-        return;
-      }
-    }
-    const saved = await saveDraft();
-    if (!saved) return;
-    const pending = saved.articles.filter(article => onlyId ? article.id === onlyId : article.status !== "ready" && article.status !== "published");
-    if (!pending.length) { setToast("All articles already have saved drafts."); return; }
-    let current = saved;
-    pause.current = false; setPauseRequested(false); setError(""); setView("articles");
-    let failed = false;
-    for (const article of pending) {
-      if (pause.current) break;
-      setGenerating(article.id); setStreamText(""); setPhase("writing");
-      try {
-        const next = await streamArticle(current, article);
-        current = { ...current, updatedAt: next.updatedAt || current.updatedAt, articles: current.articles.map(item => item.id === article.id ? next : item) };
-        syncProject(current);
-      } catch (err) {
-        failed = true; failure(err);
-        try { const result = await request<{ project: Project }>(`/api/projects/${current.id}`); current = result.project; syncProject(current); } catch { /* The original connection error remains visible. */ }
-        break;
-      } finally {
-        const latest = await refreshWritingStatus();
-        if (!keyRef.current && !sharedAvailable(latest)) pause.current = true;
-      }
-    }
-    setGenerating(null); setStreamText("");
-    const finalStatus = await refreshWritingStatus();
-    if (!failed) setToast(!keyRef.current && sharedPaused(finalStatus) ? `Shared writing is paused until ${utcReset(finalStatus?.cloudflare.usage?.resetsAt)}. Finished articles are saved.` : pause.current ? "Writing paused. Finished articles are saved." : "Your article drafts are ready to review.");
+    try {
+      await runDraftOperation(async () => {
+        if (!apiKey.trim()) {
+          const latest = await refreshWritingStatus();
+          if (!sharedAvailable(latest)) {
+            setReturnView(view); setView("settings");
+            setError(sharedPaused(latest) ? `Shared writing is paused until ${utcReset(latest?.cloudflare.usage?.resetsAt)}. Your drafts are safe.` : "Shared free writing is not ready yet. The site owner can finish setup; visitors do not need a key.");
+            return;
+          }
+        }
+        const saved = await persistDraft();
+        if (!saved) return;
+        const pending = saved.articles.filter(article => onlyId ? article.id === onlyId : article.status !== "ready" && article.status !== "published");
+        if (!pending.length) { setToast("All articles already have saved drafts."); return; }
+        let current = saved;
+        pause.current = false; setPauseRequested(false); setError(""); setView("articles");
+        let failed = false;
+        for (const article of pending) {
+          if (pause.current) break;
+          setGenerating(article.id); setStreamText(""); setPhase("writing");
+          try {
+            const next = await streamArticle(current, article);
+            current = { ...current, updatedAt: next.updatedAt || current.updatedAt, articles: current.articles.map(item => item.id === article.id ? next : item) };
+            syncProject(current);
+          } catch (err) {
+            failed = true; failure(err);
+            try { const result = await request<{ project: Project }>(`/api/projects/${current.id}`); current = result.project; syncProject(current); } catch { /* The original connection error remains visible. */ }
+            break;
+          } finally {
+            const latest = await refreshWritingStatus();
+            if (!keyRef.current && !sharedAvailable(latest)) pause.current = true;
+          }
+        }
+        const finalStatus = await refreshWritingStatus();
+        if (!failed) setToast(!keyRef.current && sharedPaused(finalStatus) ? `Shared writing is paused until ${utcReset(finalStatus?.cloudflare.usage?.resetsAt)}. Finished articles are saved.` : pause.current ? "Writing paused. Finished articles are saved." : "Your article drafts are ready to review.");
+      });
+    } catch (err) { failure(err); }
   }
   async function publishArticle(article: Article) {
     if (!project) return;
@@ -317,13 +347,13 @@ function Workspace({ user, onLogout, onSessionExpired }: { user: User; onLogout:
   const brandCard = <section className="journal-card"><div className="journal-card-heading"><h2>Brand essentials</h2><span className={`journal-chip ${project ? "is-saved" : ""}`}>{project ? dirty ? "Unsaved changes" : "Saved" : "New publication"}</span></div><div className="journal-brand-fields"><div className={`journal-logo-upload ${dragLogo ? "is-dragging" : ""}`} onDragOver={event => { if (!brandLocked && !working) { event.preventDefault(); setDragLogo(true); } }} onDragLeave={() => setDragLogo(false)} onDrop={event => { event.preventDefault(); uploadLogo(event.dataTransfer.files[0]); }}><input ref={fileInput} className="journal-sr-only" type="file" id="brand-logo" accept="image/png,image/jpeg,image/webp" disabled={brandLocked || working} onChange={event => uploadLogo(event.target.files?.[0])} />{brand.logo ? <img src={brand.logo} alt="Company logo" /> : <span className="journal-logo-placeholder"><Upload size={22} /></span>}<div><button className="journal-text-link" disabled={brandLocked || working} onClick={() => fileInput.current?.click()}>{brand.logo ? "Change logo" : "Upload your logo"}</button><p>PNG, JPG or WebP · Up to 1 MB</p></div>{brand.logo && <button className="journal-icon-button" disabled={brandLocked || working} onClick={() => updateBrand("logo", null)} aria-label="Remove company logo"><X size={16} /></button>}</div><div className="journal-field"><label htmlFor="company-name">Company name</label><input id="company-name" autoComplete="organization" value={brand.name} disabled={brandLocked || working} maxLength={80} placeholder="e.g. Monday Studio" onChange={event => updateBrand("name", event.target.value)} /></div><div className="journal-field"><label htmlFor="brand-color">Brand colour</label><div className="journal-color-field"><input type="color" value={/^#[0-9a-f]{6}$/i.test(brand.color) ? brand.color : "#1B2A4A"} disabled={brandLocked || working} aria-label="Choose your brand colour" onChange={event => updateBrand("color", event.target.value.toUpperCase())} /><input id="brand-color" value={brand.color} disabled={brandLocked || working} maxLength={7} spellCheck={false} placeholder="#1B2A4A" onChange={event => updateBrand("color", event.target.value.toUpperCase())} /></div></div><details className="journal-brand-options"><summary>Audience & editorial voice <ChevronDown size={14} /></summary><div className="journal-field"><label htmlFor="audience">Who are you writing for? <span>Optional</span></label><input id="audience" value={brand.audience} disabled={brandLocked || working} maxLength={200} placeholder="e.g. Independent business owners" onChange={event => updateBrand("audience", event.target.value)} /></div><div className="journal-field"><label htmlFor="tone">Editorial voice</label><select id="tone" value={brand.tone} disabled={brandLocked || working} onChange={event => updateBrand("tone", event.target.value)}>{["Warm & approachable", "Clear & professional", "Thoughtful & editorial", "Bold & conversational"].map(tone => <option key={tone}>{tone}</option>)}</select></div></details>{brandLocked && <p className="journal-help-text">Brand details are fixed after an article is published.</p>}<div className="journal-save-state"><span className={`journal-health-dot ${healthError ? "is-error" : statusClass(health?.database.status || "unknown")}`} /><span>{healthError ? "Database status unavailable" : health && statusClass(health.database.status) === "is-good" ? "Publication storage available" : health ? "Publication storage unavailable" : "Checking publication storage…"}</span></div></div></section>;
   const topicCard = <section className="journal-card"><div className="journal-card-heading"><h2>Topic input matrix</h2><span className="journal-chip">{cleanTopics.length} / 10</span></div><p className="journal-card-description">One topic, one article. Drag to reorder or use the arrows.</p><TopicComposer topics={topics} onChange={setTopics} locked={topicsLocked} existing={!!project} /><div className="journal-composer-actions"><button className="journal-button primary" disabled={working || !cleanTopics.length || project?.status === "published" || !apiKey && managedPaused} onClick={() => generateDrafts()}>{generating ? <Loader2 size={16} className="journal-spin" /> : <FileText size={16} />}{!apiKey && managedPaused ? "Shared writing paused" : "Generate Article Drafts"}<ArrowRight size={16} /></button><button className="journal-button secondary" disabled={working || !dirty || brandLocked} onClick={saveDraft}>{busy ? <Loader2 size={15} className="journal-spin" /> : <Save size={15} />}Save publication draft</button><p className="journal-help-text">Aiming for ~1,000 words per article. Review every draft before publishing.</p></div></section>;
 
-  return <div className="journal-app"><header className="journal-header"><div className="journal-header-brand"><button className="journal-wordmark" onClick={() => navigate("articles")} aria-label="Stova editorial desk">STOVA<span>•</span></button><span className="journal-tagline">THE INDEPENDENT PUBLISHING STUDIO</span></div><div className="journal-project-switch"><label htmlFor="publication-select">PUBLICATION</label><div><select id="publication-select" value={project?.id || "new"} disabled={working || !!editing || loading} onChange={event => selectPublication(event.target.value)}><option value="new">New publication</option>{projects.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></div></div><div className="journal-session-control"><span title={user.email}>{user.name}</span><button type="button" disabled={working || !!editing} onClick={async () => { setBusy(true); try { await onLogout(); } catch (err) { failure(err); } finally { setBusy(false); } }}>Sign out</button></div></header><nav className="journal-nav" aria-label="Workspace sections">{([['articles', 'Articles', FileText], ['publications', 'Publications', FolderOpen], ['topics', 'Topics', Settings2], ['settings', 'Settings', Settings2]] as const).map(([id, label, Icon]) => <button key={id} className={view === id && !editing ? "is-active" : ""} disabled={working || !!editing && id !== "settings"} onClick={() => navigate(id)}><Icon size={15} />{label}{id === "publications" && projects.length > 0 && <span>{projects.length}</span>}</button>)}<button className="journal-nav-new" disabled={working || !!editing} onClick={newPublication}><Plus size={15} />New publication</button></nav>
+  return <div className="journal-app"><header className="journal-header"><div className="journal-header-brand"><button className="journal-wordmark" onClick={() => navigate("articles")} aria-label="Stova editorial desk">STOVA<span>•</span></button><span className="journal-tagline">THE INDEPENDENT PUBLISHING STUDIO</span></div><div className="journal-project-switch"><label htmlFor="publication-select">PUBLICATION</label><div><select id="publication-select" value={project?.id || "new"} disabled={working || !!editing || loading} onChange={event => selectPublication(event.target.value)}><option value="new">New publication</option>{projects.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></div></div><div className="journal-session-control"><span title={user.email}>{user.name}</span><button type="button" disabled={working || !!editing} onClick={signOut}>Sign out</button></div></header><nav className="journal-nav" aria-label="Workspace sections">{([['articles', 'Articles', FileText], ['publications', 'Publications', FolderOpen], ['topics', 'Topics', Settings2], ['settings', 'Settings', Settings2]] as const).map(([id, label, Icon]) => <button key={id} className={view === id && !editing ? "is-active" : ""} disabled={working || !!editing && id !== "settings"} onClick={() => navigate(id)}><Icon size={15} />{label}{id === "publications" && projects.length > 0 && <span>{projects.length}</span>}</button>)}<button className="journal-nav-new" disabled={working || !!editing} onClick={newPublication}><Plus size={15} />New publication</button></nav>
     <div className="journal-statusbar" aria-label="Service health"><button className={`journal-health-item ${statusClass(providerStatus)}`} onClick={() => editing ? setConnectionModal(true) : navigate("settings")}><span className="journal-health-dot" />{providerLabel}</button><span className={`journal-health-item ${healthError ? "is-error" : statusClass(health?.worker.status || "unknown")}`} title={health ? `API execution: ${health.worker.durationMs} ms` : undefined}><span className="journal-health-dot" />{healthError ? "API check unavailable" : roundTrip !== null && health ? `API ${roundTrip} ms` : "API not checked"}</span><span className={`journal-health-item ${healthError ? "is-error" : statusClass(health?.database.status || "unknown")}`}><span className="journal-health-dot" />{healthError ? "Database check unavailable" : health ? statusClass(health.database.status) === "is-good" ? `Database healthy · ${Math.round(health.database.durationMs)} ms` : "Database unavailable" : "Database not checked"}</span><button className="journal-health-refresh" disabled={healthChecking} onClick={() => checkHealth(!!apiKey || serverConfigured)} aria-label="Refresh service health"><RefreshCw size={13} className={healthChecking ? "journal-spin" : ""} /><span>{healthChecking ? "Checking…" : health ? `Checked ${timestamp(health.checkedAt)}` : "Check services"}</span></button></div>
     <main className="journal-main">{error && <div className="journal-alert is-error" role="alert"><span>{error}</span><button className="journal-icon-button" onClick={() => setError("")} aria-label="Dismiss error"><X size={16} /></button></div>}
       {editing && project ? <ArticleStudio project={project} article={editing} apiKey={apiKey} serverConfigured={serverConfigured} writingPaused={!apiKey && managedPaused} writingUnavailableReason={writingUnavailableReason} managedWritingLabel={managedPaused ? "Shared writing paused" : serverConfigured ? "Shared studio writing" : writingStatusError || writingStatus?.status === "unavailable" ? "Shared writing unavailable" : "Shared writing needs setup"} onWritingComplete={async () => { await refreshWritingStatus(); }} onClose={() => setEditing(null)} onSaved={article => { syncProject({ ...project, articles: project.articles.map(item => item.id === article.id ? article : item) }); setEditing(article); }} onPublished={next => { syncProject(next); const article = next.articles.find(item => item.id === editing.id); if (article) setEditing(article); setToast("Article published."); }} onNeedConnection={() => setConnectionModal(true)} /> : <>
       {view === "articles" && <><div className="journal-page-heading"><div><p className="journal-eyebrow">{project ? project.name : "YOUR WORKSPACE"}</p><h1>The editorial desk.</h1><p>Your brand, your topics, and a clear path from draft to published.</p></div><div className="journal-heading-actions">{project && published > 0 && <a className="journal-button secondary" href={`/blog/${project.id}`} target="_blank" rel="noopener noreferrer">View publication<ExternalLink size={15} /></a>}</div></div><div className="journal-workspace"><aside className="journal-composer">{brandCard}{sharedWritingCard}{topicCard}</aside><section className="journal-pipeline"><div className="journal-pipeline-toolbar"><div><h2>Article pipeline</h2><p>{project ? `${ready} of ${project.articles.length} drafts ready · ${published} published` : "Your topics will appear here as you add them."}</p></div><div>{generating ? <button className="journal-button secondary" disabled={pauseRequested} onClick={() => { pause.current = true; setPauseRequested(true); }}><Pause size={15} />{pauseRequested ? "Pausing after this article" : "Pause writing"}</button> : project && ready === project.articles.length && published < project.articles.length ? <button className="journal-button primary" disabled={working} onClick={publishCollection}><Globe size={15} />Publish all ready</button> : null}</div></div>{rows.length ? <div className="journal-table-scroll"><table className="journal-table"><thead><tr><th scope="col" className="journal-order-column">No.</th><th scope="col">ARTICLE / TOPIC</th><th scope="col">STATUS</th><th scope="col">WORDS</th><th scope="col">UPDATED</th><th scope="col"><span className="journal-sr-only">Actions</span></th></tr></thead><tbody>{rows.map((article, index) => <ArticleRow key={article.id} article={article} index={index} saved={!!project} generating={generating === article.id} phase={phase} streamText={streamText} busy={working} writingPaused={!apiKey && managedPaused} onEdit={() => { const saved = project?.articles.find(item => item.id === article.id); if (saved) { setEditing(saved); setError(""); } }} onDownload={() => download(article)} onPublish={() => publishArticle(article)} onGenerate={() => generateDrafts(article.id)} />)}</tbody></table></div> : <div className="journal-empty"><span className="journal-empty-icon"><FileText size={33} /></span><h3>Your next edition starts here.</h3><p>Add your brand details and a few topics. Each one becomes a separate article, ready for your review.</p><span className="journal-empty-rule" /><span>UP TO 10 TOPICS · ONE CONSISTENT PUBLICATION</span></div>}<div className="journal-pipeline-footer"><span><Save size={14} />{project ? `Last saved ${timestamp(project.updatedAt)}` : "Save a draft to keep your publication."}</span><span>Review first. Publish when ready.</span></div></section></div></>}
       {view === "topics" && <><div className="journal-page-heading"><div><p className="journal-eyebrow">EDITORIAL PLANNING</p><h1>Your topic list.</h1><p>Keep every article focused with tags and a few notes for the writer.</p></div><button className="journal-button secondary" onClick={() => setView("articles")}><ArrowLeft size={15} />Back to articles</button></div><div className="journal-topics-page">{topicCard}</div></>}
-      {view === "publications" && <><div className="journal-page-heading"><div><p className="journal-eyebrow">THE LIBRARY</p><h1>Every brand, in one place.</h1><p>Keep separate publications for your clients, projects and ideas.</p></div><button className="journal-button primary" onClick={newPublication}><Plus size={16} />New publication</button></div><div className="journal-library-controls"><div className="journal-filter-tabs">{["all", "published", "draft"].map(value => <button key={value} className={filter === value ? "is-active" : ""} onClick={() => setFilter(value)}>{value === "all" ? "All publications" : value === "published" ? "Published" : "Drafts"}</button>)}</div><label className="journal-search"><Search size={16} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a publication" aria-label="Search publications" /></label></div>{loading ? <div className="journal-empty"><Loader2 size={24} className="journal-spin" /><p>Opening your publication library…</p></div> : filteredProjects.length ? <div className="journal-publication-grid">{filteredProjects.map(item => <article key={item.id} className="journal-publication-card"><div className="journal-publication-card-top"><span className="journal-publication-monogram" style={{ borderColor: item.color }}>{item.logo ? <img src={item.logo} alt="" /> : item.name.charAt(0).toUpperCase()}</span><span className={`journal-badge ${item.status}`}>{item.status === "published" ? "Published" : item.articles.some(a => a.status === "published") ? "Partly published" : "Draft"}</span></div><h2>{item.name}</h2><p>{item.articles.length} {item.articles.length === 1 ? "article" : "articles"} · {item.articles.filter(a => a.status === "published").length} published</p><div className="journal-publication-color"><span style={{ background: item.color }} />{item.color}<span>Updated {timestamp(item.updatedAt)}</span></div><div className="journal-publication-card-actions"><button className="journal-button secondary" onClick={() => selectPublication(item.id)}>Open publication<ArrowRight size={15} /></button>{item.articles.some(a => a.status === "published") && <a className="journal-icon-button" href={`/blog/${item.id}`} target="_blank" rel="noopener noreferrer" aria-label={`View ${item.name}`}><ExternalLink size={16} /></a>}<button className="journal-icon-button" onClick={() => setDeleteTarget(item)} aria-label={`Delete ${item.name}`}><Trash2 size={16} /></button></div></article>)}</div> : <div className="journal-empty"><FolderOpen size={32} /><h3>{search || filter !== "all" ? "No matching publications." : "Your library is ready for its first edition."}</h3><p>{search || filter !== "all" ? "Try a different search or view all publications." : "Create a publication for your brand or a client. Your saved work will live here."}</p><button className="journal-button primary" onClick={search || filter !== "all" ? () => { setSearch(""); setFilter("all"); } : newPublication}>{search || filter !== "all" ? "View all publications" : "Create a publication"}<ArrowRight size={15} /></button></div>}</>}
+      {view === "publications" && <><div className="journal-page-heading"><div><p className="journal-eyebrow">THE LIBRARY</p><h1>Every brand, in one place.</h1><p>Keep separate publications for your clients, projects and ideas.</p></div><button className="journal-button primary" onClick={newPublication}><Plus size={16} />New publication</button></div><div className="journal-library-controls"><div className="journal-filter-tabs">{["all", "published", "draft"].map(value => <button key={value} className={filter === value ? "is-active" : ""} onClick={() => setFilter(value)}>{value === "all" ? "All publications" : value === "published" ? "Published" : "Drafts"}</button>)}</div><label className="journal-search"><Search size={16} /><input value={search} onChange={event => setSearch(event.target.value)} placeholder="Find a publication" aria-label="Search publications" /></label></div>{loading ? <div className="journal-empty"><Loader2 size={24} className="journal-spin" /><p>Opening your publication library…</p></div> : filteredProjects.length ? <div className="journal-publication-grid">{filteredProjects.map(item => <article key={item.id} className="journal-publication-card"><div className="journal-publication-card-top"><span className="journal-publication-monogram" style={{ borderColor: item.color }}>{item.logo ? <img src={item.logo} alt="" loading="lazy" decoding="async" /> : item.name.charAt(0).toUpperCase()}</span><span className={`journal-badge ${item.status}`}>{item.status === "published" ? "Published" : item.articles.some(a => a.status === "published") ? "Partly published" : "Draft"}</span></div><h2>{item.name}</h2><p>{item.articles.length} {item.articles.length === 1 ? "article" : "articles"} · {item.articles.filter(a => a.status === "published").length} published</p><div className="journal-publication-color"><span style={{ background: item.color }} />{item.color}<span>Updated {timestamp(item.updatedAt)}</span></div><div className="journal-publication-card-actions"><button className="journal-button secondary" onClick={() => selectPublication(item.id)}>Open publication<ArrowRight size={15} /></button>{item.articles.some(a => a.status === "published") && <a className="journal-icon-button" href={`/blog/${item.id}`} target="_blank" rel="noopener noreferrer" aria-label={`View ${item.name}`}><ExternalLink size={16} /></a>}<button className="journal-icon-button" onClick={() => setDeleteTarget(item)} aria-label={`Delete ${item.name}`}><Trash2 size={16} /></button></div></article>)}</div> : <div className="journal-empty"><FolderOpen size={32} /><h3>{search || filter !== "all" ? "No matching publications." : "Your library is ready for its first edition."}</h3><p>{search || filter !== "all" ? "Try a different search or view all publications." : "Create a publication for your brand or a client. Your saved work will live here."}</p><button className="journal-button primary" onClick={search || filter !== "all" ? () => { setSearch(""); setFilter("all"); } : newPublication}>{search || filter !== "all" ? "View all publications" : "Create a publication"}<ArrowRight size={15} /></button></div>}</>}
       {view === "settings" && <><div className="journal-page-heading"><div><p className="journal-eyebrow">STUDIO SETTINGS</p><h1>Your writing connection.</h1><p>A real connection, checked when you need it.</p></div>{returnView && <button className="journal-button secondary" onClick={() => { setView(returnView); setReturnView(null); }}><ArrowLeft size={15} />Back to your draft</button>}</div><div className="journal-settings-grid"><section className="journal-card"><div className="journal-card-heading"><h2>Shared free writing</h2><span className={`journal-badge ${serverConfigured ? "ready" : "draft"}`}>{serverConfigured ? "Ready" : managedPaused ? "Paused" : "Setup"}</span></div>{connectionFields}</section><section className="journal-card"><div className="journal-card-heading"><h2>Workspace services</h2><button className="journal-icon-button" disabled={healthChecking} onClick={() => checkHealth(!!apiKey || serverConfigured)} aria-label="Refresh services"><RefreshCw size={16} className={healthChecking ? "journal-spin" : ""} /></button></div><dl className="journal-service-list"><div><dt>API round trip</dt><dd>{roundTrip === null ? "Not checked" : `${roundTrip} ms`}</dd></div><div><dt>Publication database</dt><dd>{healthError ? "Check unavailable" : health ? statusClass(health.database.status) === "is-good" ? `Healthy · ${Math.round(health.database.durationMs)} ms` : "Unavailable" : "Not checked"}</dd></div><div><dt>Writing connection</dt><dd>{providerLabel}</dd></div><div><dt>Last checked</dt><dd>{health ? timestamp(health.checkedAt) : "Not checked"}</dd></div></dl><p className="journal-help-text">Service status refreshes every minute while this page is visible. Times are measured from actual requests.</p><div className="journal-settings-note"><h3>One studio. More than one story.</h3><p>Each publication keeps its own logo, colour and article collection. Use the publication selector above to return to saved work.</p></div></section></div></>}
       </>}
     </main><footer className="journal-footer"><span>STOVA · INDEPENDENT PUBLISHING</span><span>Your words. Your brand. Your next edition.</span></footer>

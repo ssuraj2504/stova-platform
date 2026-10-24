@@ -24,3 +24,5 @@ export type Project = {
   updatedAt: string;
   articles: Article[];
 };
+export type ArticleSummary = Omit<Article, "content" | "constraints">;
+export type ProjectSummary = Omit<Project, "articles"> & { articles: ArticleSummary[] };

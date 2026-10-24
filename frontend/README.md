@@ -21,7 +21,7 @@ npm test
 npm run build
 ```
 
-The production bundle is written to `dist/`. The platform gateway serves it and forwards `/api`, including streaming generation responses, to FastAPI. Non-API paths must fall back to `dist/index.html` so public journal URLs work when opened directly.
+The production bundle is written to `dist/`. The platform gateway serves it and forwards `/api`, including streaming generation responses, to FastAPI. Serve the SPA shell for `/` and `/blog/*` so public journal URLs work when opened directly. Missing static assets must keep their 404 response.
 
 Public routes are `/blog/:publicationId` and `/blog/:publicationId/:articleSlug`. They read published content from `/api/publications/:publicationId` and `/api/publications/:publicationId/articles/:articleSlug` without requiring a workspace login.
 
