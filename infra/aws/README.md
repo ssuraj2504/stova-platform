@@ -68,6 +68,8 @@ The owner deployment identity needs CloudFormation, EC2/VPC, S3, IAM, SSM, and C
 
 The script waits for the stack, uploads runtime assets/images, executes a scoped SSM command, checks container health, installs the CloudFront header, and prints only public outputs. CloudFront creation/updates can take several minutes. A returned domain alone does not prove deployment health; the command must finish successfully. No live AWS deployment has been verified by the included offline checks.
 
+When moving an existing local installation, add `--defer-activation` to this initial deploy. A new distribution stays disabled while its empty database is prepared. Complete the first-import procedure below before running the separate `activate` command. The flag skips activation; it does not disable a distribution that is already live. Deploying without this flag retains the normal activation behavior.
+
 ### Existing infrastructure is frozen
 
 Initial `deploy` may create a stack. When the stack already exists, `deploy` compares its original CloudFormation template and complete parameter values with the requested configuration. JSON key order and whitespace do not count as differences. Any substantive template or parameter difference is refused **before runtime changes**, with no call to `update_stack`. An unverifiable comparison is also refused.
@@ -87,6 +89,53 @@ python scripts/aws_deploy.py release --region "$AWS_REGION" \
 ```
 
 This role can read eligibility/stack outputs, upload release assets, and execute commands on this one instance. It has no direct SSM secret-read permission or infrastructure-change permission. Release commands run as root on the host, so protect this role and the main branch as production deployment authority. The host fetches its own secrets. Each release rechecks Free account eligibility; there is no automatic paid provider or paid AWS fallback.
+
+## First database transfer
+
+This is an owner-only cutover into an already deployed, migrated **empty** destination. It transfers the complete application data: user IDs and password hashes, sessions and throttles, publications and articles, and every shared writing-budget reservation. It never replaces the schema or the destination's Alembic version row. It has no overwrite or force option and is not a general restore command for a populated installation.
+
+Pause source API writes and writing requests before creating the final backup, and keep the source writer disabled after cutover. Create a PostgreSQL 17 custom-format `pg_dump` archive and matching manifest using the same exported, consistent database snapshot. A prior snapshot does not include later registrations, edits or inference reservations. Running two independent copies against the same writing account would also split the shared budget ledger; do not resume the old writer after activation.
+
+The manifest must contain `format: "PostgreSQL custom"`, `consistentSnapshot: true`, the archive's lowercase SHA-256 and `sizeBytes` (maximum 512 MiB), exact nonnegative integer counts in `tables`, and `writingReservedNeurons`. Its table inventory must be exactly:
+
+```text
+public.alembic_version       (exactly one row)
+public.users
+public.auth_sessions
+public.auth_throttles
+public.projects
+public.articles
+public.writing_accounts
+public.writing_reservations
+```
+
+`writingReservedNeurons` must equal the reservation count times 300. The `validation` object must record `pgRestoreList`, `allTableDataEntriesPresent` and `fullArchiveDecoded` as `true`, and `tableDataEntries` as `8`. An optional `archive` filename must match the supplied dump; an optional `alembicRevision` must match the archive. These fields are owner-supplied integrity metadata, not an independent signature or proof that the source is trustworthy. Only import a trusted owner-created archive: PostgreSQL restores execute source-controlled statements.
+
+After the deferred deployment is healthy, run:
+
+```sh
+python scripts/aws_deploy.py import-db --region us-east-1 --stack stova \
+  --dump-file outputs/deployment-backups/stova-TIMESTAMP.dump \
+  --manifest-file outputs/deployment-backups/stova-TIMESTAMP.manifest.json
+
+python scripts/aws_deploy.py activate --region us-east-1 --stack stova
+```
+
+The owner helper checks Free eligibility before file access or uploads, verifies the archive against its manifest, then uploads three encrypted, private objects under one unique `imports/` prefix. The host downloads them through its own role; command arguments contain identifiers and pinned checksums, never runtime credentials or database connection secrets. It verifies both archive and manifest hashes, allowlists the expected table-data entries, and separately extracts the source Alembic revision as metadata. Unknown, missing or duplicate table data, unsupported data objects, and schema-revision mismatches are refused.
+
+The host first checks the destination without stopping the API. Once that check passes it stops the API, then uses one `psql --single-transaction` invocation for the authoritative empty/schema checks, restoration, and final exact row-count and budget-total assertions. Every application table and the migration table are locked throughout that transaction. Tables restore in foreign-key order with their constraints active. Any failed check or COPY rolls back the complete transfer. This uses [psql's transaction wrapper](https://www.postgresql.org/docs/17/app-psql.html) around the data-only SQL emitted by [pg_restore](https://www.postgresql.org/docs/17/app-pgrestore.html), so validation happens before commit. A separate check after `pg_restore --single-transaction` would be too late to roll back.
+
+The API resumes only after the verified commit, and a root-only import receipt records hashes, revision and counts. The transfer objects are deleted from S3 after confirmed success; the local backup remains intact. A failure after the API stops leaves it stopped for owner review. A failed API restart or a failed transfer-object cleanup can occur after a successful commit: inspect the receipt and database before retrying, because a second import into that now-populated database is deliberately refused. Restore output is captured rather than logged, because database errors can include private row data. Failed upload/import objects remain private and need explicit owner cleanup; no failed operation automatically overwrites records or enables the distribution.
+
+`activate` requires the import receipt and a healthy API/database, reads the existing origin secret directly from the owner's SSM parameter, rechecks Free eligibility, and enables CloudFront. It never generates a replacement secret. Verify sign-in and published pages at the returned HTTPS URL. Password hashes and IDs are preserved; a new domain and deployment signing secret require a fresh sign-in.
+
+Offline safeguards run without AWS or Docker:
+
+```sh
+python -m unittest discover -s infra/aws/tests -p 'test_aws_*.py' -q
+```
+
+The opt-in PostgreSQL proof creates and drops two uniquely named `*_test` databases containing only synthetic records in the separate local test container. Install the backend test dependencies, start `stova-platform-postgres` on port 55432, then set `STOVA_IMPORT_POSTGRES_TEST=1` and run `test_aws_import_postgres.py`. It proves successful full-data restoration, exact-count rollback, nonempty refusal, revision refusal, and active foreign-key rollback. It does not read or change the local application database.
 
 ## Backup, restore, and teardown
 

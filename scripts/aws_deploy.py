@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -323,9 +324,82 @@ def deploy(session, args):
     store_runtime(session, args.stack, values)
     ensure_instance_running(session, state["InstanceId"])
     release(session, args, gate=False)
-    require_free_plan(session)
-    activate_distribution(session, state, values["ORIGIN_VERIFY_SECRET"])
+    if not getattr(args, "defer_activation", False):
+        require_free_plan(session)
+        activate_distribution(session, state, values["ORIGIN_VERIFY_SECRET"])
+    else:
+        state = {**state, "activationDeferred": True}
     return state
+
+
+def import_inputs(args):
+    """Read only owner-supplied metadata and fingerprint the binary archive."""
+    if not args.dump_file or not args.manifest_file:
+        raise Refusal("Initial import requires --dump-file and --manifest-file from one consistent snapshot.")
+    archive, metadata = Path(args.dump_file).expanduser().resolve(), Path(args.manifest_file).expanduser().resolve()
+    if not metadata.is_file() or metadata.stat().st_size > 65536:
+        raise Refusal("The initial-import manifest is missing or too large.")
+    try:
+        spec = importlib.util.spec_from_file_location("stova_import_runtime", AWS / "runtime.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        manifest = module.validate_import_manifest(json.loads(metadata.read_text(encoding="utf-8")))
+    except Exception:
+        raise Refusal("The initial-import manifest could not be validated.") from None
+    fingerprint = dump_fingerprint(archive)
+    if fingerprint != {"sha256": manifest["sha256"], "sizeBytes": manifest["sizeBytes"]} or manifest.get("archive", archive.name) != archive.name:
+        raise Refusal("The source archive does not match its initial-import manifest.")
+    with metadata.open("rb") as handle:
+        manifest_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    return archive, metadata, manifest, manifest_digest
+
+
+def initial_import(session, args):
+    # No local private file read, upload, runtime replacement, or SSM command is
+    # permitted until the account's active Free plan has been checked.
+    require_free_plan(session)
+    validate_stack(args.stack)
+    archive, metadata, manifest, metadata_digest = import_inputs(args)
+    stack = stack_details(session, args.stack)
+    if not stack or stack.get("StackStatus") not in ("CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"):
+        raise Refusal("Deploy a healthy destination stack before the initial database import.")
+    state = outputs(stack)
+    prefix = "imports/" + secrets.token_hex(16)
+    key, manifest_key, runtime_key = prefix + "/source.dump", prefix + "/manifest.json", prefix + "/runtime.py"
+    s3 = session.client("s3")
+    require_free_plan(session)
+    for filename, target in ((archive, key), (metadata, manifest_key), (AWS / "runtime.py", runtime_key)):
+        s3.upload_file(str(filename), state["ReleaseBucket"], target, ExtraArgs={"ServerSideEncryption": "AES256"})
+    with (AWS / "runtime.py").open("rb") as handle:
+        runtime_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    download = ("import boto3,hashlib,os\n"
+                "p='/opt/stova/runtime.py.next'\n"
+                f"boto3.client('s3',region_name={args.region!r}).download_file({state['ReleaseBucket']!r}, {runtime_key!r}, p)\n"
+                f"if hashlib.sha256(open(p,'rb').read()).hexdigest() != {runtime_digest!r}:\n"
+                "    raise RuntimeError('Import runtime checksum did not match.')\n"
+                "os.replace(p,'/opt/stova/runtime.py')")
+    command = " ".join(shlex.quote(value) for value in ("/opt/stova/tools/bin/python", "/opt/stova/runtime.py", "import-db", "--region", args.region, "--stack", args.stack, "--bucket", state["ReleaseBucket"], "--key", key, "--sha256", manifest["sha256"], "--manifest-key", manifest_key, "--manifest-sha256", metadata_digest))
+    remote(session, state["InstanceId"], ["set -eu", "test -f /opt/stova/bootstrap-ready", "/opt/stova/tools/bin/python -c " + shlex.quote(download), command], "Stova first empty database import")
+    # These objects contain private password hashes, sessions and article data.
+    # Delete the transfer copies after verified success; the owner's local dump
+    # remains intact. Failed transfers remain private for explicit investigation.
+    s3.delete_objects(Bucket=state["ReleaseBucket"], Delete={"Objects": [{"Key": key}, {"Key": manifest_key}, {"Key": runtime_key}], "Quiet": True})
+    return {**state, "imported": True, "archiveSha256": manifest["sha256"], "tables": manifest["tables"], "writingReservedNeurons": manifest["writingReservedNeurons"]}
+
+
+def activate(session, args):
+    require_free_plan(session)
+    validate_stack(args.stack)
+    state = outputs(stack_details(session, args.stack))
+    remote(session, state["InstanceId"], ["set -eu", "test -f /opt/stova/initial-import-receipt.json", "docker compose --env-file /opt/stova/.runtime.env -f /opt/stova/compose.aws.yaml exec -T api python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/readyz\", timeout=10).read()' >/dev/null"], "Verify initial Stova import readiness")
+    payload = session.client("ssm").get_parameter(Name=f"/stova/{args.stack}/runtime", WithDecryption=True)
+    values = json.loads(payload["Parameter"]["Value"])
+    secret = values.get("ORIGIN_VERIFY_SECRET") if isinstance(values, dict) else None
+    if not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", secret):
+        raise Refusal("The deployed origin-verification secret could not be verified. No new secret was generated.")
+    require_free_plan(session)
+    activate_distribution(session, state, secret)
+    return {**state, "activated": True}
 
 
 def backup_sidecar(path):
@@ -431,7 +505,7 @@ def destroy(session, args):
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("action", nargs="?", default="plan", choices=["plan", "deploy", "release", "backup", "destroy"])
+    result.add_argument("action", nargs="?", default="plan", choices=["plan", "deploy", "release", "backup", "destroy", "import-db", "activate"])
     result.add_argument("--region", default=os.environ.get("AWS_REGION", "us-east-1"))
     result.add_argument("--profile")
     result.add_argument("--stack", default="stova")
@@ -441,6 +515,9 @@ def parser():
     result.add_argument("--github-repo", default="")
     result.add_argument("--backup-dir")
     result.add_argument("--backup-file", help="Destroy only: a previously downloaded .dump with its matching integrity/stack-identity .dump.json sidecar. Review backup freshness before use.")
+    result.add_argument("--dump-file", help="Initial import only: full PostgreSQL custom archive; destination must be empty.")
+    result.add_argument("--manifest-file", help="Initial import only: metadata and checksums for the same consistent snapshot.")
+    result.add_argument("--defer-activation", action="store_true", help="Deploy only: keep a new CloudFront distribution disabled until initial import and explicit activate.")
     return result
 
 
@@ -449,6 +526,10 @@ def main(argv=None, session=None):
     try:
         if args.backup_file and args.action != "destroy":
             raise Refusal("--backup-file is only supported for destroy. The backup command always creates a fresh export.")
+        if (args.dump_file or args.manifest_file) and args.action != "import-db":
+            raise Refusal("--dump-file and --manifest-file are only supported for import-db.")
+        if args.defer_activation and args.action != "deploy":
+            raise Refusal("--defer-activation is only supported for deploy.")
         session = session or boto3.Session(profile_name=args.profile, region_name=args.region)
         if args.action == "plan":
             plan = account_plan(session)
@@ -461,6 +542,10 @@ def main(argv=None, session=None):
         elif args.action == "backup":
             _, destination = backup(session, args)
             state = {"backup": str(destination), "evidence": str(backup_sidecar(destination))}
+        elif args.action == "import-db":
+            state = initial_import(session, args)
+        elif args.action == "activate":
+            state = activate(session, args)
         else:
             state = destroy(session, args)
         print(json.dumps(state, indent=2))
