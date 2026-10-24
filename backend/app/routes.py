@@ -1,20 +1,21 @@
 import asyncio
+import base64
 from contextlib import aclosing
 from datetime import timedelta, timezone
 import json
 import anyio
 from time import perf_counter
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 from .auth import current_user
 from .db import get_session
 from .errors import AppError
 from .models import Article, Project, User, new_id, utcnow
-from .schemas import ArticlePatch, BrandPatch, KeyPayload, Payload, Polish, ProjectCreate, TopicsPatch
-from .serialization import article_json, count_words, project_json, slugify, stamp
+from .schemas import ArticlePatch, BrandPatch, KeyPayload, Payload, Polish, ProjectCreate, TopicsPatch, validate_logo
+from .serialization import article_json, count_words, project_json, project_summary, slugify, stamp
 
 router = APIRouter(prefix="/api", tags=["Publishing"])
 SILENT_REQUEST_DEADLINE_SECONDS = 50.0
@@ -71,8 +72,20 @@ def distinct_slugs(topics) -> list[str]:
 
 @router.get("/projects")
 async def projects_get(user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
-    projects = (await session.scalars(select(Project).where(Project.owner_id == user.id).options(selectinload(Project.articles)).order_by(Project.updated_at.desc()).limit(100))).all()
-    return {"projects": [project_json(project) for project in projects]}
+    # The workspace shows the 100 most recently updated publications. Heavy fields
+    # are deferred in SQL, so saved logos and article bodies never enter this list.
+    query = (
+        select(Project, (Project.logo.is_not(None) & (Project.logo != "")).label("has_logo"))
+        .where(Project.owner_id == user.id)
+        .options(
+            load_only(Project.id, Project.name, Project.color, Project.audience, Project.tone, Project.status, Project.created_at, Project.updated_at, raiseload=True),
+            selectinload(Project.articles).load_only(Article.id, Article.title, Article.slug, Article.status, Article.word_count, Article.error, Article.updated_at, Article.tag, Article.drop_cap, Article.position, raiseload=True),
+        )
+        .order_by(Project.updated_at.desc(), Project.id.desc())
+        .limit(100)
+    )
+    projects = (await session.execute(query)).all()
+    return {"projects": [project_summary(project, has_logo) for project, has_logo in projects]}
 
 
 @router.post("/projects", status_code=201)
@@ -89,6 +102,19 @@ async def projects_post(body: ProjectCreate, user: User = Depends(current_user),
 @router.get("/projects/{project_id}")
 async def project_get(project_id: str, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
     return {"project": project_json(await owned_project(session, user, project_id))}
+
+
+@router.get("/projects/{project_id}/logo")
+async def project_logo_get(project_id: str, user: User = Depends(current_user), session: AsyncSession = Depends(get_session)):
+    logo = await session.scalar(select(Project.logo).where(Project.id == project_id, Project.owner_id == user.id))
+    try:
+        if not validate_logo(logo):
+            raise ValueError("No logo")
+        metadata, encoded = logo.split(",", 1)
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        raise AppError("Logo not found.", 404) from None
+    return Response(content=raw, media_type=metadata[5:].split(";", 1)[0], headers={"Cache-Control": "private, no-store"})
 
 
 @router.patch("/projects/{project_id}")
