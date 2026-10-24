@@ -17,21 +17,34 @@ from .schemas import Login, Register, Payload
 from .serialization import user_json
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+SCRYPT_N = 16384
+SCRYPT_R = 8
+SCRYPT_P = 5
+SCRYPT_PREFIX = f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}$"
+LEGACY_SCRYPT_PREFIX = "scrypt$16384$8$1$"
+DUMMY_PASSWORD_HASH = SCRYPT_PREFIX + "00" * 16 + "$" + "00" * 32
 
 
 def hash_password(password: str) -> str:
     salt = secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
-    return f"scrypt$16384$8$1${salt.hex()}${digest.hex()}"
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=32, maxmem=64 * 1024 * 1024)
+    return f"{SCRYPT_PREFIX}{salt.hex()}${digest.hex()}"
 
 
 def verify_password(password: str, encoded: str) -> bool:
     try:
-        method, n, r, p, salt, expected = encoded.split("$")
-        if (method, n, r, p) != ("scrypt", "16384", "8", "1"):
+        if not isinstance(password, str) or not isinstance(encoded, str) or len(encoded) > 128:
             return False
-        digest = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=16384, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
-        return hmac.compare_digest(digest, bytes.fromhex(expected))
+        method, n, r, p, salt, expected = encoded.split("$")
+        if (method, n, r, p) not in {("scrypt", "16384", "8", "1"), ("scrypt", "16384", "8", "5")}:
+            return False
+        if len(salt) != 32 or len(expected) != 64:
+            return False
+        raw_salt, raw_expected = bytes.fromhex(salt), bytes.fromhex(expected)
+        if len(raw_salt) != 16 or len(raw_expected) != 32:
+            return False
+        digest = hashlib.scrypt(password.encode(), salt=raw_salt, n=SCRYPT_N, r=SCRYPT_R, p=int(p), dklen=32, maxmem=64 * 1024 * 1024)
+        return hmac.compare_digest(digest, raw_expected)
     except (ValueError, TypeError):
         return False
 
@@ -105,9 +118,11 @@ async def register(body: Register, request: Request, response: Response, session
 async def login(body: Login, request: Request, response: Response, session: AsyncSession = Depends(get_session)):
     await throttle(request, session)
     user = await session.scalar(select(User).where(User.email == str(body.email).lower()))
-    dummy = "scrypt$16384$8$1$" + "00" * 16 + "$" + "00" * 32
     async with request.app.state.password_slots:
-        valid = await asyncio.to_thread(verify_password, body.password, user.password_hash if user else dummy)
+        valid = await asyncio.to_thread(verify_password, body.password, user.password_hash if user else DUMMY_PASSWORD_HASH)
+        if user and valid and user.password_hash.startswith(LEGACY_SCRYPT_PREFIX):
+            # Commit the upgraded hash with the new session after successful proof.
+            user.password_hash = await asyncio.to_thread(hash_password, body.password)
     if not user or not valid:
         raise AppError("The email or password is incorrect.", 401)
     return await sign_in(request, response, session, user)
