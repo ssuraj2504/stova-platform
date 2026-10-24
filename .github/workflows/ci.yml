@@ -49,7 +49,7 @@ jobs:
       - run: pip install -e './backend[test]' -r gateway/requirements.txt boto3 cfn-lint
       - run: python -m pytest -c backend/pyproject.toml backend/tests tests -q --import-mode=importlib
       - run: python -m unittest discover -s infra/aws/tests -v
-      - run: cfn-lint infra/aws/template.json
+      - run: cfn-lint infra/aws/template.json infra/aws/template.direct.json
       - run: python -m compileall -q backend/app gateway scripts
   containers:
     needs: [frontend, backend]

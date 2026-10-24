@@ -1,6 +1,8 @@
 # AWS deployment
 
-This is an optional, credit-backed deployment. It has **not** been deployed by preparing these files. AWS resources consume credits; this is not a permanent-free hosting promise.
+The reviewer deployment is available at [stova.174.129.245.156.sslip.io](https://stova.174.129.245.156.sslip.io/). It runs the direct EC2 HTTPS mode described below. Sign-in, generation of a 1,049-word article, publishing, and public readers were verified on **24 October 2026**. This records the verification date, rather than guaranteeing future availability.
+
+AWS hosting is credit-backed and time-limited. Resources consume credits; this is not a permanent-free hosting promise. Keep private backups and review account eligibility before each deployment or release.
 
 The deploy and release commands refuse to create or update workloads unless AWS's `GetAccountPlanState` reports all of:
 
@@ -9,21 +11,17 @@ The deploy and release commands refuse to create or update workloads unless AWS'
 - Positive `accountPlanRemainingCredits.amount`, with unit `USD`
 - A future `accountPlanExpirationDate`
 
-Missing permissions, old paid accounts, expired credits, and unknown responses fail closed. There is no paid-plan override. A budget alert is not used as a spending cap. Do not upgrade the account to a paid plan while these resources remain: retained EC2 storage, S3 objects, and CloudFront can then incur normal charges. AWS Free accounts can stop working when their credits or time expire.
+Missing permissions, old paid accounts, expired credits, and unknown responses fail closed. There is no paid-plan override. A budget alert is not used as a spending cap. Do not upgrade the account to a paid plan while these resources remain: EC2 storage, public IPv4 addresses, S3 objects, and any CloudFront distribution can then incur normal charges. AWS Free accounts can stop working when their credits or time expire.
 
 ## What runs
 
 A single AL2023 `t3.micro` runs Docker Compose with FastAPI, the Tornado/React gateway, and PostgreSQL 17. PostgreSQL uses a persistent Docker volume on the encrypted 20 GB EC2 root disk. Container restarts and releases preserve it; deleting/replacing the instance destroys it.
 
-CloudFront provides an HTTPS `cloudfront.net` URL with its default certificate. Caching is disabled, and viewer headers/cookies/query strings are forwarded for authentication and SSE. CloudFront reaches the origin over HTTP on port 8080. That port accepts only the AWS-managed CloudFront origin-facing prefix list, and the gateway also requires a random `X-Stova-Origin` verification header. SSH, PostgreSQL, and the API port are not exposed.
-
-The origin secret is installed through the CloudFront SDK after stack creation, rather than embedded in the CloudFormation template. This intentionally creates a small, managed CloudFormation drift (`Enabled` and the origin header); `aws_deploy.py deploy` reapplies it. Do not enable the distribution manually before runtime setup.
-
 S3 stores private encrypted image archives and database exports. JWT, PostgreSQL, Cloudflare, and origin-verification secrets live in a Standard SSM SecureString at `/stova/STACK/runtime`; the host fetches them directly into a root-only runtime file. They are not sent in user data, CloudFormation parameters, deployment command lines, repository files, or script output. The EC2 IAM role uses IMDSv2 with a one-hop limit, which prevents ordinary container access to instance credentials.
 
-The host rechecks Free account eligibility every five minutes. If verification fails, it stops the workload and instance while preserving the disk. This is a secondary operational guard, **not a billing hard cap**: retained resources still exist. An explicit owner `deploy` can resume an existing stopped instance only after a fresh positive Free-plan check. It then reapplies runtime settings and updates CloudFront to the instance's current origin hostname. There is no paid-plan recovery or instance replacement fallback.
+The host rechecks Free account eligibility every five minutes. If verification fails, it stops the workload and instance while preserving the disk; direct mode also stops Caddy. This is a secondary operational guard, **not a billing hard cap**: retained resources still exist. An explicit owner `deploy` can resume an existing stopped instance only after a fresh positive Free-plan check. It reapplies runtime settings for the selected hosting mode. There is no paid-plan recovery or instance replacement fallback.
 
-### Explicit direct HTTPS alternative
+### Direct HTTPS: current deployment
 
 `--hosting direct` selects a separate reviewed template for a **new stack**. It creates no CloudFront resources and makes no CloudFront SDK calls. It never converts or replaces an existing CloudFront installation; the infrastructure comparison still refuses changes to an existing stack. Account/service verification failures do not trigger an automatic architecture or paid-account fallback.
 
@@ -46,6 +44,14 @@ python scripts/aws_deploy.py deploy --hosting direct --region us-east-1 \
 Then follow `import-db` and `activate` below using `--stack stova-direct`. `HOSTING_MODE`, `PUBLIC_HOSTNAME` and `WEB_BIND` come from verified stack outputs, not owner-provided overrides. Application-only `release` commands infer the existing mode from stored runtime configuration. Verify the returned HTTPS URL from an external browser after activation; local trusted-TLS readiness alone is not an Internet reachability test.
 
 The public IPv4 allocation and other AWS resources consume credits, including while an Elastic IP remains allocated to a stopped instance. They are not permanently free. Teardown of the direct stack skips CloudFront and releases the Elastic IP along with the instance/resources. Keep the hostname's address allocated while using it: after release, a later owner of that IP can use the same address-derived DNS name. Free DNS and certificate services are external dependencies with their own availability and limits.
+
+### CloudFront compatibility mode
+
+The separate CloudFront template remains supported for new stacks where the account is eligible to provision that service. The CLI defaults to `--hosting cloudfront`; use an explicit `--hosting direct` for the current architecture. Account verification blocked the initial CloudFront deployment, so the reviewer deployment uses direct HTTPS instead. A service restriction never triggers an automatic hosting change.
+
+CloudFront provides an HTTPS `cloudfront.net` URL with its default certificate. Caching is disabled, and viewer headers/cookies/query strings are forwarded for authentication and SSE. CloudFront reaches the origin over HTTP on port 8080. That port accepts only the AWS-managed CloudFront origin-facing prefix list, and the gateway also requires a random `X-Stova-Origin` verification header. SSH, PostgreSQL, and the API port are not exposed.
+
+The origin secret is installed through the CloudFront SDK after stack creation, rather than embedded in the CloudFormation template. This intentionally creates a small, managed CloudFormation drift (`Enabled` and the origin header); `aws_deploy.py deploy` reapplies it and refreshes the origin hostname after an instance resumes. Do not enable a new distribution manually before runtime setup. CloudFront-specific permissions, activation, and teardown calls apply only to this mode.
 
 ## Read-only eligibility check
 
@@ -83,22 +89,22 @@ Only set the confirmation to `true` after the owner has confirmed the Cloudflare
 Run the explicit deployment after reviewing the read-only eligibility result:
 
 ```sh
-python scripts/aws_deploy.py deploy --region us-east-1 --stack stova \
+python scripts/aws_deploy.py deploy --hosting direct --region us-east-1 --stack stova-direct \
   --env-file .env.aws.local --archive outputs/images.tar.gz \
   --release-id initial --github-repo ssuraj2504/stova-platform
 ```
 
-The owner deployment identity needs CloudFormation, EC2/VPC, S3, IAM, SSM, and CloudFront provisioning permissions in addition to the eligibility read permission. Existing-stack checks require `cloudformation:GetTemplate`; resuming a stopped host requires EC2 describe/start/waiter permissions. The script installs a pinned Docker Compose plugin with a checksum check. The AMI is resolved from AWS's public AL2023 parameter on first creation, then pinned for later runtime deployments.
+The owner deployment identity needs CloudFormation, EC2/VPC, S3, IAM, and SSM provisioning permissions in addition to the eligibility read permission. CloudFront mode also needs CloudFront permissions. Existing-stack checks require `cloudformation:GetTemplate`; resuming a stopped host requires EC2 describe/start/waiter permissions. The script installs a pinned Docker Compose plugin with a checksum check. The AMI is resolved from AWS's public AL2023 parameter on first creation, then pinned for later runtime deployments.
 
-The script waits for the stack, uploads runtime assets/images, executes a scoped SSM command, checks container health, installs the CloudFront header, and prints only public outputs. CloudFront creation/updates can take several minutes. A returned domain alone does not prove deployment health; the command must finish successfully. No live AWS deployment has been verified by the included offline checks.
+The script waits for the stack, uploads runtime assets/images, executes a scoped SSM command, checks container health, and activates the selected public edge unless activation is deferred. Direct mode configures Caddy; CloudFront mode installs the origin header and enables its distribution. Provisioning and certificate or distribution activation can take several minutes. A returned domain alone does not prove deployment health; the command must finish successfully and the public URL must be checked separately. The offline checks validate refusal logic and structure, rather than performing these live checks.
 
-When moving an existing local installation, add `--defer-activation` to this initial deploy. A new distribution stays disabled while its empty database is prepared. Complete the first-import procedure below before running the separate `activate` command. The flag skips activation; it does not disable a distribution that is already live. Deploying without this flag retains the normal activation behavior.
+When moving an existing local installation, add `--defer-activation` to this initial deploy. A new direct host keeps Caddy stopped; a new CloudFront distribution stays disabled while its empty database is prepared. Complete the first-import procedure below before running the separate `activate` command. The flag skips activation; it does not turn off an edge that is already live. Deploying without this flag retains the normal activation behavior.
 
 ### Existing infrastructure is frozen
 
 Initial `deploy` may create a stack. When the stack already exists, `deploy` compares its original CloudFormation template and complete parameter values with the requested configuration. JSON key order and whitespace do not count as differences. Any substantive template or parameter difference is refused **before runtime changes**, with no call to `update_stack`. An unverifiable comparison is also refused.
 
-An unchanged stack can receive runtime settings, application images and origin-header configuration, and an existing stopped instance can be resumed while Free eligibility is verified. Use `release` for normal application-only updates. Changes to the AMI, networking, disks, IAM resources, GitHub repository parameters or any other infrastructure need a separately reviewed backup, change set and data-migration plan outside this helper. Removing or replacing the EC2 instance destroys its database disk; the helper never attempts that as a repair.
+An unchanged stack can receive runtime settings, application images and public-edge configuration, and an existing stopped instance can be resumed while Free eligibility is verified. Use `release` for normal application-only updates. Changes to the AMI, networking, disks, IAM resources, GitHub repository parameters or any other infrastructure need a separately reviewed backup, change set and data-migration plan outside this helper. Removing or replacing the EC2 instance destroys its database disk; the helper never attempts that as a repair.
 
 The first direct host provisioned on 2026-10-24 encountered an AL2023 package conflict: its preinstalled `curl-minimal` conflicted with an explicit full `curl` package request. The owner performed a Free-gated, one-time package swap on that still-empty host, then SHA-verified and reran its original frozen user-data script; bootstrap completed. The corrected script for **future stacks** uses the preinstalled curl binary instead. Consequently, that existing stack's original user-data differs from the corrected source template: `deploy` intentionally refuses that infrastructure difference until a separate review. Its normal application-only `release` path is unaffected. This repair does not authorize automatic template updates, instance replacement, or bypassing the immutable comparison.
 
@@ -106,7 +112,9 @@ The first direct host provisioned on 2026-10-24 encountered an AL2023 package co
 
 The optional role trusts only `repo:ssuraj2504/stova-platform:ref:refs/heads/main` when that repository parameter is used. A job with `environment: production` has a different OIDC subject and will not match this trust. Use a protected main branch and the repository's reviewed manual deployment workflow; never deploy pull requests.
 
-Set workflow variables `AWS_REGION`, `AWS_STACK_NAME`, and `AWS_ROLE_ARN` from the stack's `GitHubRoleArn` output. Assume the role using GitHub OIDC (`id-token: write`), build the three-image archive above, then run:
+Set workflow variables `AWS_REGION` and `AWS_STACK_NAME` to the stack's region and name, and `AWS_ROLE_ARN` to its `GitHubRoleArn` output.
+
+The reviewer repository has these variables configured for region `us-east-1` and stack `stova-direct`. Verification runs on pushes and pull requests; AWS releases are an explicit manual workflow dispatch, not an automatic deployment after every push. To release from the trusted workflow, assume the role using GitHub OIDC (`id-token: write`), build the three-image archive above, then run:
 
 ```sh
 python scripts/aws_deploy.py release --region "$AWS_REGION" \
@@ -140,20 +148,20 @@ public.writing_reservations
 After the deferred deployment is healthy, run:
 
 ```sh
-python scripts/aws_deploy.py import-db --region us-east-1 --stack stova \
+python scripts/aws_deploy.py import-db --region us-east-1 --stack stova-direct \
   --dump-file outputs/deployment-backups/stova-TIMESTAMP.dump \
   --manifest-file outputs/deployment-backups/stova-TIMESTAMP.manifest.json
 
-python scripts/aws_deploy.py activate --region us-east-1 --stack stova
+python scripts/aws_deploy.py activate --region us-east-1 --stack stova-direct
 ```
 
 The owner helper checks Free eligibility before file access or uploads, verifies the archive against its manifest, then uploads three encrypted, private objects under one unique `imports/` prefix. The host downloads them through its own role; command arguments contain identifiers and pinned checksums, never runtime credentials or database connection secrets. It verifies both archive and manifest hashes, allowlists the expected table-data entries, and separately extracts the source Alembic revision as metadata. Unknown, missing or duplicate table data, unsupported data objects, and schema-revision mismatches are refused.
 
 The host first checks the destination without stopping the API. Once that check passes it stops the API, then uses one `psql --single-transaction` invocation for the authoritative empty/schema checks, restoration, and final exact row-count and budget-total assertions. Every application table and the migration table are locked throughout that transaction. Tables restore in foreign-key order with their constraints active. Any failed check or COPY rolls back the complete transfer. This uses [psql's transaction wrapper](https://www.postgresql.org/docs/17/app-psql.html) around the data-only SQL emitted by [pg_restore](https://www.postgresql.org/docs/17/app-pgrestore.html), so validation happens before commit. A separate check after `pg_restore --single-transaction` would be too late to roll back.
 
-The API resumes only after the verified commit, and a root-only import receipt records hashes, revision and counts. The transfer objects are deleted from S3 after confirmed success; the local backup remains intact. A failure after the API stops leaves it stopped for owner review. A failed API restart or a failed transfer-object cleanup can occur after a successful commit: inspect the receipt and database before retrying, because a second import into that now-populated database is deliberately refused. Restore output is captured rather than logged, because database errors can include private row data. Failed upload/import objects remain private and need explicit owner cleanup; no failed operation automatically overwrites records or enables the distribution.
+The API resumes only after the verified commit, and a root-only import receipt records hashes, revision and counts. The transfer objects are deleted from S3 after confirmed success; the local backup remains intact. A failure after the API stops leaves it stopped for owner review. A failed API restart or a failed transfer-object cleanup can occur after a successful commit: inspect the receipt and database before retrying, because a second import into that now-populated database is deliberately refused. Restore output is captured rather than logged, because database errors can include private row data. Failed upload/import objects remain private and need explicit owner cleanup; no failed operation automatically overwrites records or activates the public edge.
 
-`activate` requires the import receipt and a healthy API/database, reads the existing origin secret directly from the owner's SSM parameter, rechecks Free eligibility, and enables CloudFront. It never generates a replacement secret. Verify sign-in and published pages at the returned HTTPS URL. Password hashes and IDs are preserved; a new domain and deployment signing secret require a fresh sign-in.
+The separate `activate` command requires the import receipt and a healthy API/database, uses the existing origin secret from SSM, and rechecks Free eligibility. It starts Caddy with trusted HTTPS validation for direct mode, or enables the CloudFront distribution for CloudFront mode. It never generates a replacement secret. Verify sign-in and published pages at the returned HTTPS URL. Password hashes and IDs are preserved; a new domain and deployment signing secret require a fresh sign-in.
 
 Offline safeguards run without AWS or Docker:
 
@@ -168,7 +176,7 @@ The opt-in PostgreSQL proof creates and drops two uniquely named `*_test` databa
 Export regularly and before any infrastructure change:
 
 ```sh
-python scripts/aws_deploy.py backup --region us-east-1 --stack stova \
+python scripts/aws_deploy.py backup --region us-east-1 --stack stova-direct \
   --backup-dir outputs/database-backups
 ```
 
@@ -179,16 +187,16 @@ Keep the dump and its sidecar together outside Git, protect access, and test a r
 Releases retain the PostgreSQL volume but database schema migrations run on API startup. A previous image archive is not a database migration rollback. A failed release can leave the site unavailable; inspect the SSM command, preserve the database, and deploy a compatible fix or restore the reviewed backup.
 
 ```sh
-python scripts/aws_deploy.py destroy --region us-east-1 --stack stova \
+python scripts/aws_deploy.py destroy --region us-east-1 --stack stova-direct \
   --backup-dir outputs/database-backups
 ```
 
-By default, teardown first takes a fresh live backup. If that export fails, nothing is deleted. After a successful backup it disables CloudFront, clears the private S3 bucket, deletes the stack and deletes the runtime SSM parameter.
+By default, teardown first takes a fresh live backup. If that export fails, nothing is deleted. After a successful backup it disables the distribution in CloudFront mode, clears the private S3 bucket, deletes the stack and deletes the runtime SSM parameter. Direct-mode stack deletion also removes the public host and releases its Elastic IP; it makes no CloudFront calls.
 
 If the guard has stopped the instance, cleanup can instead use a previously downloaded, reviewed backup without starting paid compute or contacting the stopped host:
 
 ```sh
-python scripts/aws_deploy.py destroy --region us-east-1 --stack stova \
+python scripts/aws_deploy.py destroy --region us-east-1 --stack stova-direct \
   --backup-file outputs/database-backups/stova-TIMESTAMP.dump
 ```
 
@@ -202,7 +210,8 @@ Cleanup remains available on paid/expired accounts because it does not create or
 
 ```sh
 python infra/aws/template.py
-cfn-lint infra/aws/template.json
+python infra/aws/template_direct.py
+cfn-lint infra/aws/template.json infra/aws/template.direct.json
 python -m unittest discover -s infra/aws/tests -v
 ```
 
