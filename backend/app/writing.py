@@ -156,7 +156,21 @@ class Writer:
         content = ""
         for attempt in range(2):
             yield "status", {"phase": "revising" if attempt else "writing"}
-            user = f"Write a 1,000-word article, 950–1,100 words, with a short introduction, 5–7 descriptive ## sections and a concise ending. Do not repeat the title as a heading. Brief: {brief}" if not attempt else f"Revise this draft to 1,000 words (950–1,100 words) with descriptive ## sections. It currently has {count_words(content)} words. Preserve the topic and improve substance. Return the complete revised article only. Brief: {brief}\n\nDraft:\n{content}"
+            output = "Use descriptive ## section headings. Do not repeat the title as a heading. Return the complete article only, without word counts or notes."
+            if not attempt:
+                structure = "Write exactly eight ## sections in total, including the opening section and the closing section. The opening and ending are two of the eight sections, not extra paragraphs outside them. Develop every section to approximately 120–130 words with concrete explanations, practical examples and useful detail. Aim for about 1,020 words including headings."
+                user = f"Write a complete 1,000-word article. The acceptable total is 950–1,100 words; do not finish below that range. {structure} {output}\n\nBrief: {brief}"
+            else:
+                words = count_words(content)
+                if words < 950:
+                    additions = max(1, round((1020 - words) / 125))
+                    adjustment = f"Keep the existing useful sections and add {additions} NEW, distinct, topic-specific ## section(s), approximately 120–135 words each, with substantive explanation, examples and actionable detail. This needs approximately {1020 - words} additional words overall. Make only necessary edits to the existing material; do not replace it with a shorter rewrite."
+                elif words > 1100:
+                    adjustment = f"Remove approximately {words - 1020} words by tightening repeated ideas and unnecessary phrasing, combining redundant sections where helpful. Preserve the article's useful explanations, accurate meaning and complete ending; do not simply cut off trailing text."
+                else:
+                    adjustment = "Keep the current length and useful material, and fix the missing ## section headings."
+                failure = f"The current draft has {words} words, outside the acceptable 950–1,100-word range." if not 950 <= words <= 1100 else f"The current draft has {words} words but is missing the required ## section headings."
+                user = f"Revise the draft below rather than copying it unchanged. {failure} Your target is about 1,020 words, within 950–1,100 words. {adjustment} Preserve the topic and accurate meaning. Include all existing retained sections and all new sections in your response. {output}\n\nBrief: {brief}\n\nDraft to revise:\n{content}"
             chunks = []
             async for text in self.complete(connection, user):
                 chunks.append(text)

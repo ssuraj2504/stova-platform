@@ -83,6 +83,8 @@ npm run dev
 
 Vite forwards `/api` to FastAPI. To preview the production frontend, run `npm run build` in `frontend`, then `python -m gateway.main` from the repository root.
 
+For local Docker development, an ignored `compose.override.yaml` can mount `./backend/app` read-only at `/app/app` in the API service. Restart the API after Python edits with `docker compose restart api`; this avoids rebuilding dependencies for a source-only change. Verification and deployment continue to build the full image from the tracked Dockerfile.
+
 Backend and importer integration tests require a **separate disposable PostgreSQL database** in `TEST_DATABASE_URL`; they reset its schema. Never point them at a development or production database containing data.
 
 ```sh
