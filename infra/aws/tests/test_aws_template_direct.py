@@ -3,6 +3,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 import re
+import shlex
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -130,6 +131,16 @@ class DirectTemplateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder, patch.object(direct, "HERE", Path(folder)):
             with self.assertRaises(FileNotFoundError):
                 direct.template()
+
+    def test_al2023_bootstrap_uses_existing_curl_without_conflicting_package_swap(self):
+        bootstrap = self.direct["Resources"]["Instance"]["Properties"]["UserData"]["Fn::Base64"]
+        packages = [shlex.split(line)[4:] for line in bootstrap.splitlines() if line.startswith("retry dnf install ")]
+        self.assertTrue(packages, "The package installation must remain visible to this regression check.")
+        for command in packages:
+            self.assertNotIn("curl", command, "AL2023 curl-minimal conflicts with the full curl package.")
+        self.assertIn("command -v curl >/dev/null", bootstrap)
+        self.assertNotIn("dnf swap", bootstrap)
+        self.assertNotIn("--allowerasing", bootstrap)
 
 
 if __name__ == "__main__":

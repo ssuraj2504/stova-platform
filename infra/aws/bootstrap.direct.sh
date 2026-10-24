@@ -12,7 +12,10 @@ retry() {
   return 1
 }
 
-retry dnf install -y docker python3.12 python3.12-pip curl tar
+# AL2023 already provides curl-minimal. Requesting the full curl package here
+# conflicts with it; its existing HTTPS-capable curl binary is sufficient.
+command -v curl >/dev/null
+retry dnf install -y docker python3.12 python3.12-pip tar
 systemctl enable --now docker
 systemctl enable --now amazon-ssm-agent
 install -d -m 700 /opt/stova /opt/stova/releases
