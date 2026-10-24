@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -83,6 +84,35 @@ def outputs(stack):
     if not stack:
         raise Refusal("The stack does not exist. Run the explicit initial deploy first.")
     return {item["OutputKey"]: item["OutputValue"] for item in stack.get("Outputs", [])}
+
+
+def hosting_mode(state):
+    mode = state.get("HostingMode", "cloudfront")
+    if mode not in ("cloudfront", "direct"):
+        raise Refusal("The existing stack's hosting mode could not be verified.")
+    return mode
+
+
+def set_hosting_values(values, state):
+    mode = hosting_mode(state)
+    if mode == "direct":
+        try:
+            address = ipaddress.IPv4Address(state.get("PublicAddress", ""))
+        except ipaddress.AddressValueError:
+            raise Refusal("The direct stack's assigned public address is invalid.") from None
+        hostname = f"stova.{address}.sslip.io"
+        if not address.is_global or state.get("Hostname") != hostname or state.get("Url") != "https://" + hostname:
+            raise Refusal("The direct stack's public hostname could not be verified.")
+        values.update(HOSTING_MODE="direct", PUBLIC_HOSTNAME=hostname, WEB_BIND="127.0.0.1")
+    else:
+        values.update(HOSTING_MODE="cloudfront", PUBLIC_HOSTNAME="", WEB_BIND="0.0.0.0")
+
+
+def activate_direct_host(session, state, args, *, require_import=True):
+    require_free_plan(session)
+    arguments = ("/opt/stova/tools/bin/python", "/opt/stova/runtime.py", "activate", "--region", args.region, "--stack", args.stack, *(("--require-import",) if require_import else ()))
+    command = " ".join(shlex.quote(value) for value in arguments)
+    remote(session, state["InstanceId"], ["set -eu", command], "Activate trusted Stova direct HTTPS")
 
 
 def validate_stack(name):
@@ -303,8 +333,11 @@ def deploy(session, args):
     # If this stack owns the provider, preserve the original empty parameter:
     # treating it as pre-existing would delete the provider on the next update.
     oidc = old_parameters["ExistingGitHubOidcArn"] if "ExistingGitHubOidcArn" in old_parameters else github_provider(session, repo)
-    parameters = [{"ParameterKey": "CloudFrontPrefixListId", "ParameterValue": prefix_list(session)}, {"ParameterKey": "LatestAmiId", "ParameterValue": ami}, {"ParameterKey": "GitHubRepo", "ParameterValue": repo}, {"ParameterKey": "ExistingGitHubOidcArn", "ParameterValue": oidc}]
-    template = (AWS / "template.json").read_text()
+    direct = getattr(args, "hosting", "cloudfront") == "direct"
+    parameters = [{"ParameterKey": "LatestAmiId", "ParameterValue": ami}, {"ParameterKey": "GitHubRepo", "ParameterValue": repo}, {"ParameterKey": "ExistingGitHubOidcArn", "ParameterValue": oidc}]
+    if not direct:
+        parameters.insert(0, {"ParameterKey": "CloudFrontPrefixListId", "ParameterValue": prefix_list(session)})
+    template = (AWS / ("template.direct.json" if direct else "template.json")).read_text()
     client = session.client("cloudformation")
     if existing:
         require_unchanged_infrastructure(session, existing, template, parameters)
@@ -320,13 +353,17 @@ def deploy(session, args):
         client.get_waiter("stack_create_complete").wait(StackName=args.stack, WaiterConfig={"Delay": 15, "MaxAttempts": 240})
     state = outputs(existing or stack_details(session, args.stack))
     require_free_plan(session)
+    set_hosting_values(values, state)
     values["ALLOWED_ORIGINS"] = state["Url"]
     store_runtime(session, args.stack, values)
     ensure_instance_running(session, state["InstanceId"])
     release(session, args, gate=False)
     if not getattr(args, "defer_activation", False):
-        require_free_plan(session)
-        activate_distribution(session, state, values["ORIGIN_VERIFY_SECRET"])
+        if hosting_mode(state) == "direct":
+            activate_direct_host(session, state, args, require_import=False)
+        else:
+            require_free_plan(session)
+            activate_distribution(session, state, values["ORIGIN_VERIFY_SECRET"])
     else:
         state = {**state, "activationDeferred": True}
     return state
@@ -391,6 +428,9 @@ def activate(session, args):
     require_free_plan(session)
     validate_stack(args.stack)
     state = outputs(stack_details(session, args.stack))
+    if hosting_mode(state) == "direct":
+        activate_direct_host(session, state, args)
+        return {**state, "activated": True}
     remote(session, state["InstanceId"], ["set -eu", "test -f /opt/stova/initial-import-receipt.json", "docker compose --env-file /opt/stova/.runtime.env -f /opt/stova/compose.aws.yaml exec -T api python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/readyz\", timeout=10).read()' >/dev/null"], "Verify initial Stova import readiness")
     payload = session.client("ssm").get_parameter(Name=f"/stova/{args.stack}/runtime", WithDecryption=True)
     values = json.loads(payload["Parameter"]["Value"])
@@ -490,7 +530,8 @@ def destroy(session, args):
             raise Refusal("The backup belongs to a different stack identity, possibly an older stack with the same name. Teardown was not started.")
     else:
         state, destination = backup(session, args)
-    activate_distribution(session, state, None, enabled=False)
+    if hosting_mode(state) != "direct":
+        activate_distribution(session, state, None, enabled=False)
     s3 = session.client("s3")
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=state["ReleaseBucket"]):
         objects = [{"Key": item["Key"]} for item in page.get("Contents", [])]
@@ -513,6 +554,7 @@ def parser():
     result.add_argument("--archive")
     result.add_argument("--release-id", default=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     result.add_argument("--github-repo", default="")
+    result.add_argument("--hosting", choices=["cloudfront", "direct"], default="cloudfront", help="Initial deploy architecture; existing infrastructure is never converted or replaced.")
     result.add_argument("--backup-dir")
     result.add_argument("--backup-file", help="Destroy only: a previously downloaded .dump with its matching integrity/stack-identity .dump.json sidecar. Review backup freshness before use.")
     result.add_argument("--dump-file", help="Initial import only: full PostgreSQL custom archive; destination must be empty.")

@@ -42,11 +42,12 @@ services:
   web:
     image: stova-web:release
     pull_policy: never
-    ports: ['8080:8080']
+    ports: ['${WEB_BIND:-0.0.0.0}:8080:8080']
     environment:
       BACKEND_URL: http://api:8000
       PUBLIC_HTTPS: 'true'
       ORIGIN_VERIFY_SECRET: ${ORIGIN_VERIFY_SECRET:?Origin verification required}
+      HOSTING_MODE: ${HOSTING_MODE:-cloudfront}
     depends_on:
       api: {condition: service_healthy}
     mem_limit: 128m

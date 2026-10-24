@@ -23,6 +23,30 @@ S3 stores private encrypted image archives and database exports. JWT, PostgreSQL
 
 The host rechecks Free account eligibility every five minutes. If verification fails, it stops the workload and instance while preserving the disk. This is a secondary operational guard, **not a billing hard cap**: retained resources still exist. An explicit owner `deploy` can resume an existing stopped instance only after a fresh positive Free-plan check. It then reapplies runtime settings and updates CloudFront to the instance's current origin hostname. There is no paid-plan recovery or instance replacement fallback.
 
+### Explicit direct HTTPS alternative
+
+`--hosting direct` selects a separate reviewed template for a **new stack**. It creates no CloudFront resources and makes no CloudFront SDK calls. It never converts or replaces an existing CloudFront installation; the infrastructure comparison still refuses changes to an existing stack. Account/service verification failures do not trigger an automatic architecture or paid-account fallback.
+
+The direct stack assigns an Elastic IP and publishes `https://stova.ADDRESS.sslip.io`. Its security group opens only TCP80/443 to the public; SSH, database and API ingress remain closed. Caddy terminates HTTPS on the host and proxies to the Tornado gateway at `127.0.0.1:8080`. The gateway port is bound only to loopback. Caddy overwrites the origin proof and a dedicated client-IP header; the gateway checks the proof and validates that IP in direct mode before forwarding it to the API. Arbitrary forwarded IP chains are not trusted.
+
+The boot script installs the official [Caddy v2.11.7 release](https://github.com/caddyserver/caddy/releases/tag/v2.11.7), pinned to SHA-256 `727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b`. It retries bounded package/download failures during initial EIP association. Caddy runs as an unprivileged systemd user with only the low-port binding capability. Its admin API is disabled. The root-only environment file contains the existing origin proof; the readable Caddyfile contains an environment placeholder instead of a literal secret. Access logging and environment printing are not enabled.
+
+Caddy stays stopped through a deferred first deployment and database import. Explicit activation checks local readiness and verifies that the hostname resolves exclusively to the assigned IPv4 address through the host resolver and two independent HTTPS DNS resolvers, including refusal of unexpected IPv6 answers. Only then can Caddy request a certificate from the explicitly configured Let's Encrypt ACME issuer. Activation checks a system-trusted chain and public hostname over TLS; failure disables/stops Caddy and reports a safe refusal. There is no insecure certificate bypass, HTTP application fallback, self-signed fallback, or alternate paid issuer. Do not repeatedly rerun production issuance after a failure: inspect DNS, firewall and certificate errors first. Shared `sslip.io`/`nip.io` certificate limits can cause rate-limited issuance despite correct configuration.
+
+Certificates, private keys and ACME account state persist under `/var/lib/stova-caddy` on the encrypted instance disk across releases, stops and restarts. Do not clear this directory to troubleshoot issuance: doing so can request duplicate certificates and hit limits. A normal release keeps an inactive Caddy service inactive and refreshes an already active service without deleting its state. The Free-plan guard stops Caddy too, and still requests instance shutdown if stopping containers or Caddy fails.
+
+Use the same reviewed three-image release archive and an explicitly supplied ignored runtime settings file:
+
+```sh
+python scripts/aws_deploy.py deploy --hosting direct --region us-east-1 \
+  --stack stova-direct --env-file .env.aws.local --archive outputs/images.tar.gz \
+  --release-id initial --github-repo ssuraj2504/stova-platform --defer-activation
+```
+
+Then follow `import-db` and `activate` below using `--stack stova-direct`. `HOSTING_MODE`, `PUBLIC_HOSTNAME` and `WEB_BIND` come from verified stack outputs, not owner-provided overrides. Application-only `release` commands infer the existing mode from stored runtime configuration. Verify the returned HTTPS URL from an external browser after activation; local trusted-TLS readiness alone is not an Internet reachability test.
+
+The public IPv4 allocation and other AWS resources consume credits, including while an Elastic IP remains allocated to a stopped instance. They are not permanently free. Teardown of the direct stack skips CloudFront and releases the Elastic IP along with the instance/resources. Keep the hostname's address allocated while using it: after release, a later owner of that IP can use the same address-derived DNS name. Free DNS and certificate services are external dependencies with their own availability and limits.
+
 ## Read-only eligibility check
 
 Install a current SDK in the deployment environment:

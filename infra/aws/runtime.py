@@ -3,19 +3,159 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.request
 import boto3
 
 ROOT = Path("/opt/stova")
 IMPORT_TABLES = ("users", "auth_sessions", "auth_throttles", "projects", "articles", "writing_accounts", "writing_reservations")
 MAX_IMPORT_BYTES = 512 * 1024 * 1024
+CADDY_CONFIG_DIR = Path("/etc/stova-caddy")
+TLS_READY_SECONDS = 45
+
+
+class RuntimeRefusal(RuntimeError):
+    """A deliberately public message containing no provider or secret values."""
+
+
+def render_caddyfile():
+    return """{
+    admin off
+}
+{$PUBLIC_HOSTNAME} {
+    tls {
+        issuer acme https://acme-v02.api.letsencrypt.org/directory {
+            disable_tlsalpn_challenge
+            timeout 30s
+        }
+    }
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Stova-Origin {env.ORIGIN_VERIFY_SECRET}
+        header_up X-Stova-Client-IP {remote_host}
+        flush_interval 1ms
+    }
+}
+"""
+
+
+def hosting_values(values):
+    mode = values.get("HOSTING_MODE", "cloudfront")
+    if mode not in ("cloudfront", "direct"):
+        raise RuntimeError("The hosting mode is invalid.")
+    if mode == "direct":
+        hostname = values.get("PUBLIC_HOSTNAME", "")
+        match = re.fullmatch(r"stova\.(\d{1,3}(?:\.\d{1,3}){3})\.sslip\.io", hostname) if isinstance(hostname, str) else None
+        if not match:
+            raise RuntimeError("The direct HTTPS hostname is invalid.")
+        try:
+            address = ipaddress.IPv4Address(match[1])
+        except ipaddress.AddressValueError:
+            raise RuntimeError("The direct HTTPS address is invalid.") from None
+        if not address.is_global or values.get("WEB_BIND") != "127.0.0.1" or values.get("ALLOWED_ORIGINS") != "https://" + hostname:
+            raise RuntimeError("Direct HTTPS needs its assigned public hostname and loopback gateway binding.")
+        return mode, hostname, str(address)
+    return mode, "", ""
+
+
+def verify_direct_dns(hostname, address):
+    """Check the host resolver and two independent HTTPS DNS resolvers first."""
+    local = {result[4][0] for result in socket.getaddrinfo(hostname, 443, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)}
+    if local != {address}:
+        raise RuntimeError("The direct hostname does not resolve to its assigned address.")
+    for endpoint in ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"):
+        for kind, record_type, expected in (("A", 1, {address}), ("AAAA", 28, set())):
+            request = urllib.request.Request(endpoint + "?name=" + hostname + "&type=" + kind, headers={"Accept": "application/dns-json"})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                value = json.loads(response.read(65537))
+            answers = {record.get("data") for record in value.get("Answer", []) if isinstance(record, dict) and record.get("type") == record_type}
+            if value.get("Status") != 0 or answers != expected:
+                raise RuntimeError("Independent DNS verification failed; no certificate request was started.")
+
+
+def configure_direct_tls(values):
+    hosting_values(values)
+    secret = values.get("ORIGIN_VERIFY_SECRET")
+    if not isinstance(secret, str) or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", secret):
+        raise RuntimeError("The existing origin secret is invalid.")
+    CADDY_CONFIG_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    environment = CADDY_CONFIG_DIR / "runtime.env"
+    with os.fdopen(os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
+        handle.write(f"PUBLIC_HOSTNAME='{values['PUBLIC_HOSTNAME']}'\nORIGIN_VERIFY_SECRET='{secret}'\n")
+    os.chmod(environment, 0o600)
+    config = CADDY_CONFIG_DIR / "Caddyfile"
+    config.write_text(render_caddyfile())
+    os.chmod(config, 0o644)
+    # Adapt checks the Caddyfile without starting certificate issuance. Only the
+    # public hostname is placed in this subprocess's arguments/environment.
+    subprocess.run(["/usr/local/bin/caddy", "adapt", "--config", str(config), "--adapter", "caddyfile"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={**os.environ, "PUBLIC_HOSTNAME": values["PUBLIC_HOSTNAME"]})
+
+
+def caddy_active():
+    try:
+        command("systemctl", "is-active", "--quiet", "stova-caddy", capture=True)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def trusted_tls_ready(hostname):
+    # Connect locally while verifying the public SNI name and a system-trusted
+    # certificate chain. This avoids EC2 public-IP hairpin routing assumptions.
+    with socket.create_connection(("127.0.0.1", 443), timeout=3) as connection:
+        with ssl.create_default_context().wrap_socket(connection, server_hostname=hostname) as secured:
+            secured.sendall(f"GET /readyz HTTP/1.1\r\nHost: {hostname}\r\nConnection: close\r\n\r\n".encode())
+            response = http.client.HTTPResponse(secured)
+            response.begin()
+            if response.status != 200:
+                raise RuntimeError("The trusted HTTPS endpoint is not ready.")
+            response.read(65536)
+
+
+def activate_direct(session, args):
+    free_plan(session)
+    values = settings(session, args.stack)
+    mode, hostname, address = hosting_values(values)
+    if mode != "direct":
+        raise RuntimeError("This host is not configured for direct HTTPS.")
+    if getattr(args, "require_import", False) and not (ROOT / "initial-import-receipt.json").is_file():
+        raise RuntimeError("A verified initial database import is required before activation.")
+    private_compose("exec", "-T", "api", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=10).read()")
+    try:
+        verify_direct_dns(hostname, address)
+    except Exception:
+        raise RuntimeRefusal("Independent DNS verification failed. Caddy was not started and no certificate request was made.") from None
+    free_plan(session)
+    configure_direct_tls(values)
+    try:
+        command("systemctl", "enable", "--now", "stova-caddy", capture=True)
+        deadline = time.monotonic() + TLS_READY_SECONDS
+        while True:
+            try:
+                trusted_tls_ready(hostname)
+                print("Direct HTTPS is active with a trusted certificate and healthy database.")
+                return
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise RuntimeRefusal("Trusted HTTPS did not become ready. Certificate issuance may be rate-limited; inspect Caddy before another explicit attempt. No HTTP or self-signed fallback was enabled.") from None
+                time.sleep(2)
+    except Exception:
+        try:
+            command("systemctl", "disable", "--now", "stova-caddy", capture=True)
+        except Exception:
+            command("systemctl", "stop", "stova-caddy", capture=True)
+        raise
 
 
 def validate_import_manifest(value):
@@ -223,7 +363,11 @@ def settings(session, stack):
     required = {"POSTGRES_PASSWORD", "JWT_SECRET", "ORIGIN_VERIFY_SECRET", "ALLOWED_ORIGINS"}
     if not required <= values.keys():
         raise RuntimeError("Runtime configuration is incomplete.")
-    permitted = required | {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_AI_FREE_TIER_CONFIRMED"}
+    values.setdefault("HOSTING_MODE", "cloudfront")
+    values.setdefault("PUBLIC_HOSTNAME", "")
+    values.setdefault("WEB_BIND", "0.0.0.0")
+    hosting_values(values)
+    permitted = required | {"CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_AI_FREE_TIER_CONFIRMED", "HOSTING_MODE", "PUBLIC_HOSTNAME", "WEB_BIND"}
     lines = []
     for key in sorted(permitted):
         value = str(values.get(key, ""))
@@ -235,6 +379,7 @@ def settings(session, stack):
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as handle:
         handle.write("\n".join(lines) + "\n")
     os.chmod(path, 0o600)
+    return values
 
 
 def install_guard(region, stack):
@@ -250,7 +395,8 @@ def install_guard(region, stack):
 def deploy(session, args):
     free_plan(session)
     install_guard(args.region, args.stack)
-    settings(session, args.stack)
+    values = settings(session, args.stack)
+    preserve_caddy = values.get("HOSTING_MODE") == "direct" and caddy_active()
     s3 = session.client("s3")
     target = ROOT / "releases" / f"{args.release_id}.tar.gz"
     s3.download_file(args.bucket, args.key, str(target))
@@ -262,6 +408,9 @@ def deploy(session, args):
     with target.open("rb") as archive:
         result = subprocess.run(["docker", "load"], stdin=archive, cwd=ROOT, check=True, capture_output=True)
     compose("up", "--detach", "--remove-orphans", "--wait", "--wait-timeout", "240")
+    if preserve_caddy:
+        configure_direct_tls(values)
+        command("systemctl", "restart", "stova-caddy", capture=True)
     (ROOT / "current-release.json").write_text(json.dumps({"releaseId": args.release_id, "key": args.key, "sha256": args.sha256}))
     for old in sorted((ROOT / "releases").glob("*.tar.gz"), key=lambda file: file.stat().st_mtime, reverse=True)[2:]:
         old.unlink()
@@ -281,7 +430,7 @@ def backup(session, args):
 
 def main(argv=None, session=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["deploy", "guard", "backup", "import-db"])
+    parser.add_argument("action", choices=["deploy", "guard", "backup", "import-db", "activate"])
     parser.add_argument("--region", required=True)
     parser.add_argument("--stack", required=True)
     parser.add_argument("--bucket")
@@ -290,6 +439,7 @@ def main(argv=None, session=None):
     parser.add_argument("--manifest-key")
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--release-id")
+    parser.add_argument("--require-import", action="store_true")
     args = parser.parse_args(argv)
     try:
         session = session or boto3.Session(region_name=args.region)
@@ -298,6 +448,11 @@ def main(argv=None, session=None):
                 free_plan(session)
             except Exception:
                 try:
+                    if Path("/etc/systemd/system/stova-caddy.service").is_file():
+                        try:
+                            command("systemctl", "stop", "stova-caddy", capture=True)
+                        except Exception:
+                            print("The HTTPS service could not stop gracefully; requesting instance shutdown.", file=sys.stderr)
                     if (ROOT / "compose.aws.yaml").exists():
                         compose("down")
                 except Exception:
@@ -307,6 +462,8 @@ def main(argv=None, session=None):
                     # Docker failure must never bypass the instance shutdown.
                     command("shutdown", "-h", "now")
                 return 2
+        elif args.action == "activate":
+            activate_direct(session, args)
         elif args.action == "import-db":
             import_database(session, args)
         elif args.action == "backup":
@@ -315,7 +472,7 @@ def main(argv=None, session=None):
             deploy(session, args)
     except Exception as error:
         # Provider exceptions may contain request payloads; output only their type.
-        print(f"Runtime operation failed ({type(error).__name__}).", file=sys.stderr)
+        print(f"Runtime operation refused: {error}" if isinstance(error, RuntimeRefusal) else f"Runtime operation failed ({type(error).__name__}).", file=sys.stderr)
         return 1
     return 0
 
