@@ -1,6 +1,7 @@
 """Tornado serves the React build and forwards REST/SSE to the private FastAPI API."""
 import asyncio
 import hmac
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -28,10 +29,12 @@ class SecurityHeaders:
             self.set_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data: https://fastapi.tiangolo.com; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 
     def prepare(self):
+        self.origin_verified = False
         if self.request.path in ("/healthz", "/readyz"):
             return
         secret = self.settings.get("origin_verify_secret", "")
-        if secret and not hmac.compare_digest(self.request.headers.get("X-Stova-Origin", ""), secret):
+        self.origin_verified = bool(secret) and hmac.compare_digest(self.request.headers.get("X-Stova-Origin", ""), secret)
+        if secret and not self.origin_verified:
             raise tornado.web.HTTPError(403)
 
 
@@ -39,12 +42,23 @@ class APIProxy(SecurityHeaders, tornado.web.RequestHandler):
     SUPPORTED_METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
 
     async def proxy(self, *args):
+        client_ip = self.request.remote_ip
+        if self.settings.get("hosting_mode") == "direct" and self.origin_verified:
+            # The host proxy overwrites this header with its socket peer. It is
+            # trusted only in direct mode after that proxy's proof is verified.
+            supplied = self.request.headers.get("X-Stova-Client-IP", "")
+            try:
+                if "%" in supplied:
+                    raise ValueError("Scoped addresses are not public proxy peers")
+                client_ip = str(ipaddress.ip_address(supplied))
+            except ValueError:
+                raise tornado.web.HTTPError(400, reason="Invalid proxy client address") from None
         self.disconnected = False
         self.pending_task = asyncio.current_task()
         headers = {name: self.request.headers[name] for name in ("Accept", "Content-Type", "Cookie", "Origin", "Sec-Fetch-Site") if name in self.request.headers}
         headers["Host"] = self.request.host
-        headers["X-Forwarded-For"] = self.request.remote_ip
-        # Production runs behind an HTTPS distribution; clients cannot supply this
+        headers["X-Forwarded-For"] = client_ip
+        # Production runs behind an HTTPS proxy; clients cannot supply this
         # flag or bypass the origin secret. Local development stays HTTP.
         headers["X-Forwarded-Proto"] = "https" if self.settings.get("public_https") else self.request.protocol
         url = self.settings["backend_url"] + self.request.path + ("?" + self.request.query if self.request.query else "")
@@ -103,22 +117,27 @@ class SPAHandler(SecurityHeaders, tornado.web.StaticFileHandler):
         self.set_header("Cache-Control", "public, max-age=31536000, immutable" if "/assets/" in self.request.path else "no-cache")
 
 
-def make_app(*, backend_url=None, static_dir=None, origin_verify_secret=None, public_https=None):
+def make_app(*, backend_url=None, static_dir=None, origin_verify_secret=None, public_https=None, hosting_mode=None):
     backend = (backend_url or os.getenv("BACKEND_URL", "http://127.0.0.1:8000")).rstrip("/")
     if urlsplit(backend).scheme not in ("http", "https") or urlsplit(backend).path not in ("", "/"):
         raise ValueError("BACKEND_URL must be an HTTP origin")
     static = Path(static_dir or os.getenv("STATIC_DIR", str(ROOT / "frontend" / "dist"))).resolve()
     origin_secret = os.getenv("ORIGIN_VERIFY_SECRET", "") if origin_verify_secret is None else origin_verify_secret
     https = os.getenv("PUBLIC_HTTPS", "false").lower() == "true" if public_https is None else public_https
+    mode = os.getenv("HOSTING_MODE", "cloudfront") if hosting_mode is None else hosting_mode
+    if mode not in ("cloudfront", "direct"):
+        raise ValueError("HOSTING_MODE must be cloudfront or direct")
     if https and not origin_secret:
         raise ValueError("ORIGIN_VERIFY_SECRET is required when PUBLIC_HTTPS is enabled")
+    if mode == "direct" and not https:
+        raise ValueError("Direct hosting requires PUBLIC_HTTPS and origin verification")
     client = httpx.AsyncClient(timeout=httpx.Timeout(210, connect=5), follow_redirects=False, trust_env=False)
     return tornado.web.Application([
         (r"/api(?:/.*)?", APIProxy),
         (r"/(?:healthz|readyz)", APIProxy),
         (r"/(.*)", SPAHandler, {"path": str(static), "default_filename": "index.html"}),
     ], backend_url=backend, http_client=client,
-       origin_verify_secret=origin_secret, public_https=https,
+       origin_verify_secret=origin_secret, public_https=https, hosting_mode=mode,
        debug=False, compress_response=False)
 
 

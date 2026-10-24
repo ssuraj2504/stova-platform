@@ -248,6 +248,7 @@ class GatewayHTTPTests(unittest.IsolatedAsyncioTestCase):
         response = await self.edge("POST", "/api/echo", json={"test": True}, headers={
             "X-Forwarded-For": "203.0.113.123", "X-Forwarded-Proto": "http",
             "Forwarded": "for=203.0.113.123;proto=http", "X-Real-IP": "203.0.113.124",
+            "X-Stova-Client-IP": "203.0.113.125",
             "Origin": "https://studio.example.test", "Sec-Fetch-Site": "same-origin",
             "Cookie": "local-session=test-cookie-value", "Accept": "application/json",
         })
@@ -258,10 +259,60 @@ class GatewayHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("forwarded", headers)
         self.assertNotIn("x-real-ip", headers)
         self.assertNotIn("x-stova-origin", headers)
+        self.assertNotIn("x-stova-client-ip", headers)
         self.assertEqual(headers["origin"], "https://studio.example.test")
         self.assertEqual(headers["sec-fetch-site"], "same-origin")
         self.assertEqual(headers["cookie"], "local-session=test-cookie-value")
         self.assertEqual(headers["accept"], "application/json")
+
+    async def test_direct_proxy_uses_one_verified_client_address(self):
+        self.app.settings["hosting_mode"] = "direct"
+        for address, canonical in (("203.0.113.42", "203.0.113.42"),
+                                   ("2001:db8:0:0:0:0:0:123", "2001:db8::123")):
+            with self.subTest(address=address):
+                response = await self.edge("POST", "/api/echo", json={}, headers={
+                    "X-Stova-Client-IP": address,
+                    "X-Forwarded-For": "203.0.113.99",
+                    "X-Real-IP": "203.0.113.98",
+                })
+                self.assertEqual(response.status_code, 200)
+                headers = response.json()["headers"]
+                self.assertEqual(headers["x-forwarded-for"], canonical)
+                self.assertEqual(headers["x-forwarded-proto"], "https")
+                self.assertNotIn("x-stova-client-ip", headers)
+                self.assertNotIn("x-stova-origin", headers)
+                self.assertNotIn("x-real-ip", headers)
+
+    async def test_direct_proxy_rejects_missing_malformed_or_chained_client_ip(self):
+        self.app.settings["hosting_mode"] = "direct"
+        for address in (None, "", "not-an-ip", "203.0.113.42, 203.0.113.43",
+                        "203.0.113.42:443", "[2001:db8::123]", "fe80::123%eth0"):
+            with self.subTest(address=address):
+                before = len(self.state.requests)
+                response = await self.edge("GET", "/api/echo", headers={
+                    "X-Stova-Client-IP": address} if address is not None else {})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(len(self.state.requests), before)
+
+    async def test_direct_client_address_does_not_replace_origin_verification(self):
+        self.app.settings["hosting_mode"] = "direct"
+        for proof in (None, "wrong-proof"):
+            with self.subTest(proof=proof):
+                before = len(self.state.requests)
+                headers = {"X-Stova-Client-IP": "203.0.113.42"}
+                if proof is not None:
+                    headers["X-Stova-Origin"] = proof
+                response = await self.client.get("/api/echo", headers=headers)
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(len(self.state.requests), before)
+        self.assertEqual((await self.client.get("/healthz")).status_code, 200)
+
+    async def test_direct_startup_requires_https_and_a_proxy_secret(self):
+        for secret, https in (("", True), (self.secret, False), ("", False)):
+            with self.subTest(secret_present=bool(secret), https=https):
+                with self.assertRaises(ValueError):
+                    make_app(backend_url=self.upstream_url, static_dir=self.static,
+                             origin_verify_secret=secret, public_https=https, hosting_mode="direct")
 
     async def test_https_origin_without_configured_proof_fails_closed(self):
         try:
